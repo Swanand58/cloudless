@@ -6,11 +6,12 @@ A completely secure, self-hosted file transfer application with end-to-end encry
 
 - **End-to-End Encryption**: Files are encrypted on your device using XSalsa20-Poly1305 before leaving your browser
 - **Zero Knowledge**: The server never sees your encryption keys, file contents, or even filenames
-- **P2P Transfers**: Direct peer-to-peer transfers when possible via WebRTC
-- **Relay Fallback**: Encrypted relay through the server when P2P isn't available
+- **Encrypted Chat**: WhatsApp-style chat interface with inline file attachments
+- **Relay Transfers**: Encrypted relay through the server for reliable file transfer
 - **Safety Numbers**: Verify you're talking to the right person with safety number comparison
-- **Secure Chat**: End-to-end encrypted messaging alongside file transfers
-- **Invite-Only**: Control who can register with invite codes
+- **Invite-Only**: Control who can register with admin-managed invite codes
+- **Role-Based Access**: Admin users can manage invites and system settings
+- **Dark/Light Theme**: System-aware theming with manual toggle option
 - **Self-Hosted**: Runs on your own hardware, under your complete control
 
 ## Security Architecture
@@ -35,11 +36,11 @@ A completely secure, self-hosted file transfer application with end-to-end encry
 
 ## Prerequisites
 
-- Python 3.11+ with [uv](https://docs.astral.sh/uv/)
-- Node.js 18+
-- [Tailscale](https://tailscale.com/) (free for personal use)
+- Docker and Docker Compose (recommended)
+- OR Python 3.11+ with [uv](https://docs.astral.sh/uv/) and Node.js 18+
+- [Tailscale](https://tailscale.com/) (free for personal use, recommended for secure access)
 
-## Quick Start
+## Quick Start with Docker
 
 ### 1. Clone and Setup
 
@@ -48,23 +49,58 @@ git clone <your-repo>
 cd cloudless
 ```
 
-### 2. Backend Setup
+### 2. Configure Environment
+
+```bash
+# Backend configuration
+cd backend
+cp .env.example .env
+# Edit .env and set a secure SECRET_KEY:
+# SECRET_KEY=$(openssl rand -hex 32)
+
+# Frontend configuration
+cd ../frontend
+cp .env.local.example .env.local
+# Edit .env.local if needed
+```
+
+### 3. Start with Docker Compose
+
+```bash
+docker-compose up -d
+```
+
+The application will be available at:
+- Frontend: http://localhost:3000
+- Backend API: http://localhost:8000
+
+### 4. Initial Admin Setup
+
+When you first start the backend, it creates an admin user. Check the backend logs for the initial credentials:
+
+```bash
+docker-compose logs backend | grep -i admin
+```
+
+**IMPORTANT**: Log in immediately and change your password via Settings.
+
+## Manual Setup (Without Docker)
+
+### Backend Setup
 
 ```bash
 cd backend
 
 # Create environment file
 cp .env.example .env
-
-# Edit .env and set a secure SECRET_KEY:
-# SECRET_KEY=$(openssl rand -hex 32)
+# Edit .env and set a secure SECRET_KEY
 
 # Install dependencies and run
 uv sync
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-### 3. Frontend Setup
+### Frontend Setup
 
 ```bash
 cd frontend
@@ -82,14 +118,6 @@ npm run dev
 npm run build
 npm start
 ```
-
-### 4. Initial Admin Setup
-
-When you first start the backend, it creates an admin user:
-- **Username**: `admin`
-- **Password**: `changeme123`
-
-**IMPORTANT**: Log in immediately and create invite codes for your friends. Then change your password.
 
 ## Tailscale Setup (Recommended)
 
@@ -136,8 +164,8 @@ tailscale cert your-machine-name.your-tailnet.ts.net
 
 1. Log in to Cloudless
 2. Click "Create New Room"
-3. Share the 6-character room code with your friend
-4. Wait for them to join
+3. Share the room code with your friend (click to copy)
+4. Wait for them to join - you'll see a notification when they do
 
 ### Joining a Room
 
@@ -149,16 +177,21 @@ tailscale cert your-machine-name.your-tailnet.ts.net
 
 Before transferring sensitive files:
 
-1. Click "Verify Identity" in the room
+1. Click "Verify Identity" in the room sidebar
 2. Compare safety numbers with your friend over phone/in-person
 3. If they match, you can be confident there's no man-in-the-middle
 
 ### Sending Files
 
-1. Drag and drop a file or click to select
-2. The file is encrypted in your browser
-3. Progress shows encryption → upload → complete
-4. Your friend can now download and decrypt
+1. Click the attachment icon in the chat input
+2. Select a file (up to 1GB supported)
+3. The file is encrypted in your browser before upload
+4. Progress shows encryption → upload → complete
+5. Your friend sees the file in the chat and can download it
+
+### Encrypted Chat
+
+Messages are end-to-end encrypted just like files. Type in the chat input and press Enter or click Send.
 
 ## Architecture
 
@@ -177,17 +210,37 @@ Before transferring sensitive files:
 │                       Your PC                                │
 │  ┌─────────────────┐         ┌─────────────────────────┐    │
 │  │  Next.js :3000  │◄───────►│    FastAPI :8000        │    │
-│  │  - React UI     │         │    - REST API           │    │
-│  │  - WebCrypto    │         │    - WebSocket          │    │
-│  │  - WebRTC       │         │    - File Relay         │    │
+│  │  - React 19     │         │    - REST API           │    │
+│  │  - shadcn/ui    │         │    - WebSocket          │    │
+│  │  - TweetNaCl    │         │    - File Relay         │    │
+│  │  - Zustand      │         │    - SQLAlchemy         │    │
 │  └─────────────────┘         └───────────┬─────────────┘    │
 │                                          │                   │
 │                              ┌───────────┴─────────────┐    │
 │                              │  SQLite   │  Encrypted  │    │
 │                              │  (users)  │  Uploads    │    │
-│                              └───────────────────────────    │
+│                              └─────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## Tech Stack
+
+### Frontend
+- Next.js 16 (App Router)
+- React 19
+- TypeScript
+- TailwindCSS v4
+- shadcn/ui components
+- Zustand (state management)
+- TweetNaCl (client-side encryption)
+
+### Backend
+- FastAPI
+- SQLAlchemy (async)
+- aiosqlite
+- PyNaCl (server-side crypto utilities)
+- Argon2id (password hashing)
+- python-jose (JWT)
 
 ## API Endpoints
 
@@ -196,8 +249,9 @@ Before transferring sensitive files:
 - `POST /api/auth/register` - Register with invite code
 - `POST /api/auth/refresh` - Refresh tokens
 - `GET /api/auth/me` - Current user info
-- `POST /api/auth/invites` - Create invite code
-- `GET /api/auth/invites` - List your invite codes
+- `PUT /api/auth/password` - Change password
+- `POST /api/auth/invites` - Create invite code (admin only)
+- `GET /api/auth/invites` - List invite codes (admin only)
 
 ### Rooms
 - `POST /api/rooms` - Create room
@@ -237,6 +291,7 @@ Before transferring sensitive files:
 3. **Secure Your Host**: Keep your PC secure - it's running your server
 4. **Regular Updates**: Keep dependencies updated
 5. **Strong Passwords**: Use strong, unique passwords
+6. **Change Default Credentials**: Change the admin password immediately after first login
 
 ## Development
 
@@ -267,11 +322,16 @@ npm run build  # Production build
 - Ensure both parties are in the same room
 - Try leaving and rejoining the room
 - Verify safety numbers match
+- Make sure the shared secret was established (wait for "Connected" status)
 
 ### "Cannot connect to server"
 - If using Tailscale, ensure both devices are connected
 - Check firewall allows connections to ports 3000 and 8000
 - Verify the NEXT_PUBLIC_API_URL is correct
+
+### "Rate limit exceeded"
+- Wait a few seconds and try again
+- This protects against abuse
 
 ## License
 
@@ -286,6 +346,6 @@ Contributions welcome! Please:
 
 Focus areas:
 - Security improvements
-- WebRTC reliability
+- Performance optimizations
 - UI/UX enhancements
 - Documentation
