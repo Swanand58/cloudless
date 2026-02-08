@@ -61,8 +61,19 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if forwarded:
             client_ip = forwarded.split(",")[0].strip()
 
-        # Rate limiting (skip for static files and WebSocket upgrades)
-        if not request.url.path.startswith("/static") and not request.url.path.startswith("/api/ws"):
+        # Skip rate limiting for:
+        # - Static files
+        # - WebSocket upgrades
+        # - OPTIONS preflight requests (CORS)
+        # - Chunk uploads (many sequential requests expected)
+        skip_rate_limit = (
+            request.url.path.startswith("/static") or
+            request.url.path.startswith("/api/ws") or
+            request.method == "OPTIONS" or
+            "/chunks/" in request.url.path
+        )
+        
+        if not skip_rate_limit:
             if not rate_limiter.is_allowed(client_ip):
                 retry_after = rate_limiter.get_retry_after(client_ip)
                 # Include CORS headers in rate limit response

@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
+import { Toaster } from "@/components/ui/sonner";
+import { ThemeProvider } from "@/components/ThemeProvider";
+import { GlobalLoader } from "@/components/GlobalLoader";
 import "./globals.css";
 
 const inter = Inter({
@@ -18,9 +21,13 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
-      <body className={`${inter.variable} font-sans antialiased bg-gray-50 dark:bg-gray-900 min-h-screen`}>
-        {children}
+    <html lang="en" suppressHydrationWarning>
+      <body className={`${inter.variable} font-sans antialiased bg-background text-foreground min-h-screen`}>
+        <ThemeProvider>
+          <GlobalLoader />
+          {children}
+          <Toaster />
+        </ThemeProvider>
       </body>
     </html>
   );

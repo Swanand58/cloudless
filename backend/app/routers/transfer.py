@@ -36,7 +36,7 @@ class InitTransferRequest(BaseModel):
     nonce: str = Field(..., description="Base64 encoded nonce for encryption")
     mode: str = Field(default="relay", pattern="^(p2p|relay)$")
     expires_in_hours: int | None = Field(default=24, ge=1, le=168)
-    max_downloads: int = Field(default=1, ge=1, le=100)
+    max_downloads: int = Field(default=9999, ge=1, le=9999)
 
 
 class TransferResponse(BaseModel):

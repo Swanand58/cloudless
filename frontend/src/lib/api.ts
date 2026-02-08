@@ -253,6 +253,17 @@ class ApiClient {
     this.clearTokens();
   }
 
+  // Password change
+  async changePassword(currentPassword: string, newPassword: string): Promise<{ message: string }> {
+    return this.request("/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    });
+  }
+
   // Invite endpoints
   async createInvite(
     maxUses: number = 1,
@@ -352,7 +363,7 @@ class ApiClient {
     nonce: string,
     mode: "p2p" | "relay" = "relay",
     expiresInHours: number = 24,
-    maxDownloads: number = 1
+    maxDownloads: number = 9999
   ): Promise<TransferResponse> {
     return this.request("/api/transfers", {
       method: "POST",

@@ -63,6 +63,7 @@ export interface UserJoinedMessage extends WebSocketMessage {
 export interface UserLeftMessage extends WebSocketMessage {
   type: "user_left";
   user_id: string;
+  display_name?: string;
   timestamp: string;
 }
 

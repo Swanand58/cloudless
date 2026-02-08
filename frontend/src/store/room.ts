@@ -17,6 +17,65 @@ export interface DecryptedMessage {
   isOwn: boolean;
 }
 
+export type FileTransferStatus = "uploading" | "encrypting" | "ready" | "downloading" | "decrypting" | "completed" | "error";
+
+export interface ChatItem {
+  id: string;
+  type: "text" | "file";
+  senderId: string;
+  senderName: string;
+  timestamp: Date;
+  isOwn: boolean;
+  // Text message fields
+  content?: string;
+  // File message fields
+  transferId?: string;
+  filename?: string;
+  fileSize?: number;
+  status?: FileTransferStatus;
+  progress?: number;
+  nonce?: string;
+  encryptedFilename?: string;
+}
+
+// Helper to merge messages and transfers into a unified timeline
+export function useChatItems(
+  messages: DecryptedMessage[],
+  transfers: TransferResponse[],
+  myUserId: string | undefined,
+  decryptedFilenames: Map<string, string>
+): ChatItem[] {
+  const textItems: ChatItem[] = messages.map((msg) => ({
+    id: msg.id,
+    type: "text" as const,
+    senderId: msg.senderId,
+    senderName: msg.senderName,
+    timestamp: msg.timestamp,
+    isOwn: msg.isOwn,
+    content: msg.content,
+  }));
+
+  const fileItems: ChatItem[] = transfers.map((t) => ({
+    id: `transfer-${t.id}`,
+    type: "file" as const,
+    senderId: t.sender_id,
+    senderName: t.sender_name,
+    timestamp: new Date(t.created_at),
+    isOwn: t.sender_id === myUserId,
+    transferId: t.id,
+    filename: decryptedFilenames.get(t.id) || undefined,
+    fileSize: t.file_size,
+    status: t.status === "ready" ? "ready" : t.status === "completed" ? "completed" : "uploading",
+    nonce: t.nonce,
+    encryptedFilename: t.encrypted_filename,
+  }));
+
+  // Merge and sort by timestamp
+  return [...textItems, ...fileItems].sort(
+    (a, b) => a.timestamp.getTime() - b.timestamp.getTime()
+  );
+}
+
 interface RoomState {
   // Current room state
   currentRoom: RoomResponse | null;
@@ -29,6 +88,8 @@ interface RoomState {
   // Online users
   onlineUsers: Set<string>;
   typingUsers: Map<string, string>; // userId -> userName
+  lastUserJoined: string | null; // For toast notification
+  lastUserLeft: string | null; // For toast notification
   
   // Transfers
   transfers: TransferResponse[];
@@ -42,6 +103,8 @@ interface RoomState {
   joinRoom: (code: string) => Promise<RoomResponse>;
   leaveRoom: () => void;
   loadRoom: (roomId: string) => Promise<void>;
+  clearLastUserJoined: () => void;
+  clearLastUserLeft: () => void;
   
   // Messaging
   sendMessage: (content: string) => void;
@@ -68,6 +131,8 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   messages: [],
   onlineUsers: new Set(),
   typingUsers: new Map(),
+  lastUserJoined: null,
+  lastUserLeft: null,
   transfers: [],
   isLoading: false,
   isConnecting: false,
@@ -160,7 +225,17 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       onlineUsers: new Set(),
       typingUsers: new Map(),
       transfers: [],
+      lastUserJoined: null,
+      lastUserLeft: null,
     });
+  },
+
+  clearLastUserJoined: () => {
+    set({ lastUserJoined: null });
+  },
+
+  clearLastUserLeft: () => {
+    set({ lastUserLeft: null });
   },
 
   loadRoom: async (roomId: string) => {
@@ -352,7 +427,7 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       });
       
       wsClient.on("user_joined", (msg) => {
-        const { user_id, public_key } = msg as unknown as { 
+        const { user_id, public_key, display_name } = msg as unknown as { 
           user_id: string; 
           public_key?: string;
           display_name?: string;
@@ -376,10 +451,21 @@ export const useRoomStore = create<RoomState>((set, get) => ({
               )
             } : null;
             
-            return { onlineUsers, sharedSecrets: newSecrets, currentRoom: updatedRoom };
+            // Get display name from message or from existing members
+            const memberName = display_name || state.currentRoom?.members.find(m => m.user_id === user_id)?.display_name;
+            
+            return { 
+              onlineUsers, 
+              sharedSecrets: newSecrets, 
+              currentRoom: updatedRoom,
+              lastUserJoined: memberName || null
+            };
           }
           
-          return { onlineUsers };
+          // Get display name for toast even when no public key
+          const memberName = display_name || state.currentRoom?.members.find(m => m.user_id === user_id)?.display_name;
+          
+          return { onlineUsers, lastUserJoined: memberName || null };
         });
         
         // Only refresh room if we don't have the public key in the message
@@ -394,13 +480,33 @@ export const useRoomStore = create<RoomState>((set, get) => ({
       });
       
       wsClient.on("user_left", (msg) => {
-        const { user_id } = msg as unknown as { user_id: string };
+        const { user_id, display_name } = msg as unknown as { user_id: string; display_name?: string };
+        
+        // Get the display name from current room members if not provided
+        const state = get();
+        const memberName = display_name || state.currentRoom?.members.find(m => m.user_id === user_id)?.display_name;
+        
         set((state) => {
           const onlineUsers = new Set(state.onlineUsers);
           onlineUsers.delete(user_id);
           const typingUsers = new Map(state.typingUsers);
           typingUsers.delete(user_id);
-          return { onlineUsers, typingUsers };
+          
+          // Update the member's is_online status in the room
+          const updatedRoom = state.currentRoom ? {
+            ...state.currentRoom,
+            members: state.currentRoom.members.map(m => 
+              m.user_id === user_id ? { ...m, is_online: false } : m
+            )
+          } : null;
+          
+          return { 
+            onlineUsers, 
+            typingUsers, 
+            currentRoom: updatedRoom,
+            // Store the last user who left for toast notification
+            lastUserLeft: memberName || "A user"
+          };
         });
       });
       

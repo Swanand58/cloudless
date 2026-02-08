@@ -74,18 +74,20 @@ class ConnectionManager:
             if not self.rooms[room_id]:
                 del self.rooms[room_id]
 
-        # Update online status in database
+        # Update online status in database and get user info
+        display_name = None
         async with async_session() as db:
             result = await db.execute(
                 select(RoomMember).where(
                     RoomMember.room_id == room_id,
                     RoomMember.user_id == user_id,
-                )
+                ).options(selectinload(RoomMember.user))
             )
             member = result.scalar_one_or_none()
             if member:
                 member.is_online = False
                 member.last_seen = datetime.now(timezone.utc)
+                display_name = member.user.display_name if member.user else None
                 await db.commit()
 
         # Notify others in room
@@ -94,6 +96,7 @@ class ConnectionManager:
             {
                 "type": "user_left",
                 "user_id": user_id,
+                "display_name": display_name,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )

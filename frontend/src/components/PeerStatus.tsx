@@ -1,6 +1,13 @@
 "use client";
 
+import { useState } from "react";
 import { useRoomStore } from "@/store/room";
+import { useAuthStore } from "@/store/auth";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Copy, Check } from "lucide-react";
+import { cn } from "@/lib/utils";
 
 interface PeerStatusProps {
   className?: string;
@@ -8,68 +15,100 @@ interface PeerStatusProps {
 
 export function PeerStatus({ className = "" }: PeerStatusProps) {
   const { currentRoom, onlineUsers } = useRoomStore();
+  const { user } = useAuthStore();
+  const [copied, setCopied] = useState(false);
 
-  if (!currentRoom) {
-    return null;
-  }
+  if (!currentRoom) return null;
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(currentRoom.code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  // Sort members: current user first, then online users, then offline
+  const sortedMembers = [...currentRoom.members].sort((a, b) => {
+    const aIsMe = a.user_id === user?.id;
+    const bIsMe = b.user_id === user?.id;
+    if (aIsMe) return -1;
+    if (bIsMe) return 1;
+    
+    const aOnline = onlineUsers.has(a.user_id);
+    const bOnline = onlineUsers.has(b.user_id);
+    if (aOnline && !bOnline) return -1;
+    if (!aOnline && bOnline) return 1;
+    return 0;
+  });
 
   return (
-    <div className={`bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 ${className}`}>
-      <h3 className="text-sm font-medium text-gray-900 dark:text-white mb-3">
-        Room Members
-      </h3>
-      
-      <div className="space-y-2">
-        {currentRoom.members.map((member) => {
+    <Card className={className}>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm">Room Members</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {sortedMembers.map((member) => {
           const isOnline = onlineUsers.has(member.user_id);
+          const isMe = member.user_id === user?.id;
           
           return (
-            <div
-              key={member.user_id}
-              className="flex items-center justify-between"
-            >
-              <div className="flex items-center">
+            <div key={member.user_id} className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
                 <div
-                  className={`w-2 h-2 rounded-full mr-2 ${
-                    isOnline ? "bg-green-500" : "bg-gray-400"
-                  }`}
+                  className={cn(
+                    "w-2 h-2 rounded-full",
+                    isOnline ? "bg-green-500" : "bg-muted-foreground/40"
+                  )}
                 />
-                <span className="text-sm text-gray-700 dark:text-gray-300">
+                <span className={cn(
+                  "text-sm",
+                  isMe ? "text-foreground font-medium" : "text-foreground"
+                )}>
                   {member.display_name}
+                  {isMe && <span className="text-muted-foreground ml-1">(you)</span>}
                 </span>
               </div>
-              
-              <span className="text-xs text-gray-500 dark:text-gray-400">
-                {isOnline ? "Online" : "Offline"}
-              </span>
+              <Badge 
+                variant={isOnline ? "default" : "secondary"} 
+                className={cn(
+                  "text-xs",
+                  !isOnline && "text-muted-foreground"
+                )}
+              >
+                {isOnline ? "Online" : "Left"}
+              </Badge>
             </div>
           );
         })}
-      </div>
-      
-      {currentRoom.members.length === 1 && (
-        <div className="mt-4 p-3 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg">
-          <p className="text-sm text-yellow-800 dark:text-yellow-200">
-            Share the room code with someone to start transferring files:
-          </p>
-          <div className="mt-2 flex items-center justify-between bg-white dark:bg-gray-900 rounded px-3 py-2">
-            <code className="text-lg font-bold text-blue-600 dark:text-blue-400 tracking-wider">
-              {currentRoom.code}
-            </code>
-            <button
-              onClick={() => {
-                navigator.clipboard.writeText(currentRoom.code);
-              }}
-              className="text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
-              title="Copy code"
-            >
-              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-              </svg>
-            </button>
+
+        {currentRoom.members.length === 1 && (
+          <div className="mt-4 p-3 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg border border-yellow-200 dark:border-yellow-800">
+            <p className="text-sm text-yellow-800 dark:text-yellow-200">
+              Share the room code with someone to start transferring files:
+            </p>
+            <div className="mt-2 flex items-center justify-between bg-card rounded px-3 py-2">
+              <code className="text-lg font-bold text-primary tracking-wider">
+                {currentRoom.code}
+              </code>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 gap-1.5"
+                onClick={handleCopy}
+                aria-label="Copy code"
+              >
+                {copied ? (
+                  <>
+                    <Check className="h-4 w-4 text-green-500" />
+                    <span className="text-xs text-green-500">Copied!</span>
+                  </>
+                ) : (
+                  <Copy className="h-4 w-4" />
+                )}
+              </Button>
+            </div>
           </div>
-        </div>
-      )}
-    </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }

@@ -56,6 +56,13 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class ChangePasswordRequest(BaseModel):
+    """Change password request body."""
+
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
 class CreateInviteRequest(BaseModel):
     """Create invite code request body."""
 
@@ -192,13 +199,43 @@ async def get_me(current_user: User = Depends(get_current_user)):
     )
 
 
-@router.post("/invites", response_model=InviteResponse)
-async def create_invite(
-    request: CreateInviteRequest,
+@router.post("/change-password")
+async def change_password(
+    request: ChangePasswordRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new invite code (any authenticated user can invite)."""
+    """Change the current user's password."""
+    from app.services.crypto import crypto_service
+
+    # Verify current password
+    if not crypto_service.verify_password(request.current_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect",
+        )
+
+    # Ensure new password is different
+    if request.current_password == request.new_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from current password",
+        )
+
+    # Update password
+    current_user.password_hash = crypto_service.hash_password(request.new_password)
+    await db.commit()
+
+    return {"message": "Password changed successfully"}
+
+
+@router.post("/invites", response_model=InviteResponse)
+async def create_invite(
+    request: CreateInviteRequest,
+    current_user: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new invite code (admin only)."""
     invite = await auth_service.create_invite_code(
         db,
         created_by=current_user.id,
@@ -219,10 +256,10 @@ async def create_invite(
 
 @router.get("/invites", response_model=list[InviteResponse])
 async def list_invites(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List invite codes created by current user."""
+    """List invite codes (admin only)."""
     result = await db.execute(
         select(InviteCode)
         .where(InviteCode.created_by == current_user.id)

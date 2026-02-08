@@ -83,7 +83,7 @@ class FileTransfer(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # Download tracking
     download_count: Mapped[int] = mapped_column(default=0)
-    max_downloads: Mapped[int] = mapped_column(default=1)
+    max_downloads: Mapped[int] = mapped_column(default=9999)
 
     # Relationships
     room: Mapped["Room"] = relationship("Room", back_populates="transfers")
