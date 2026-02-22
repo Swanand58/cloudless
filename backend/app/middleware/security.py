@@ -55,6 +55,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Middleware to add security headers to all responses."""
 
     async def dispatch(self, request: Request, call_next) -> Response:
+        # BaseHTTPMiddleware breaks WebSocket connections - skip entirely
+        if request.url.path.startswith("/api/ws"):
+            return await call_next(request)
+
         # Get client IP (handle proxies)
         client_ip = request.client.host if request.client else "unknown"
         forwarded = request.headers.get("x-forwarded-for")

@@ -1,16 +1,20 @@
 """WebSocket router for real-time communication."""
 
+import os
+import shutil
 import json
+import asyncio
 from datetime import datetime, timezone
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db, async_session
 from app.models.user import User
 from app.models.room import Room, RoomMember
 from app.models.message import Message
+from app.models.transfer import FileTransfer
 from app.services.auth import auth_service
 
 router = APIRouter(tags=["websocket"])
@@ -67,12 +71,14 @@ class ConnectionManager:
 
     async def disconnect(self, room_id: str, user_id: str):
         """Disconnect a user from a room."""
+        room_now_empty = False
+
         if room_id in self.rooms and user_id in self.rooms[room_id]:
             del self.rooms[room_id][user_id]
 
-            # Clean up empty rooms
             if not self.rooms[room_id]:
                 del self.rooms[room_id]
+                room_now_empty = True
 
         # Update online status in database and get user info
         display_name = None
@@ -100,6 +106,58 @@ class ConnectionManager:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
+
+        # If room is empty, schedule a purge after a grace period
+        # (gives users a chance to reconnect after brief disconnects)
+        if room_now_empty:
+            asyncio.create_task(self._purge_room_if_empty(room_id))
+
+    async def _purge_room_if_empty(self, room_id: str, grace_seconds: int = 60):
+        """Purge all room data if no one reconnects within the grace period."""
+        await asyncio.sleep(grace_seconds)
+
+        # Check if room is still empty (no one reconnected)
+        if room_id in self.rooms and len(self.rooms[room_id]) > 0:
+            return
+
+        print(f"[Cleanup] Purging empty room {room_id}")
+
+        async with async_session() as db:
+            # Get all transfers to delete their files
+            result = await db.execute(
+                select(FileTransfer).where(FileTransfer.room_id == room_id)
+            )
+            transfers = result.scalars().all()
+
+            for transfer in transfers:
+                if transfer.storage_path and os.path.exists(transfer.storage_path):
+                    shutil.rmtree(transfer.storage_path, ignore_errors=True)
+
+            # Delete all transfers for this room
+            await db.execute(
+                delete(FileTransfer).where(FileTransfer.room_id == room_id)
+            )
+
+            # Delete all messages for this room
+            await db.execute(
+                delete(Message).where(Message.room_id == room_id)
+            )
+
+            # Delete room members
+            await db.execute(
+                delete(RoomMember).where(RoomMember.room_id == room_id)
+            )
+
+            # Deactivate the room
+            result = await db.execute(
+                select(Room).where(Room.id == room_id)
+            )
+            room = result.scalar_one_or_none()
+            if room:
+                room.is_active = False
+
+            await db.commit()
+            print(f"[Cleanup] Room {room_id} purged: {len(transfers)} files deleted")
 
     async def broadcast_to_room(
         self,

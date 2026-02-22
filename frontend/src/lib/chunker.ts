@@ -2,7 +2,7 @@
  * File chunking utilities for large file transfers.
  */
 
-export const CHUNK_SIZE = 64 * 1024; // 64KB chunks
+export const CHUNK_SIZE = 512 * 1024; // 512KB chunks (optimized for tunnel transfers)
 
 export interface FileChunk {
   index: number;

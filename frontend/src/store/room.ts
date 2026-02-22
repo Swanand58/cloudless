@@ -70,10 +70,10 @@ export function useChatItems(
     encryptedFilename: t.encrypted_filename,
   }));
 
-  // Merge and sort by timestamp
-  return [...textItems, ...fileItems].sort(
-    (a, b) => a.timestamp.getTime() - b.timestamp.getTime()
-  );
+  // Sort by timestamp ascending (oldest first, newest at bottom)
+  const all = [...textItems, ...fileItems];
+  all.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+  return all;
 }
 
 interface RoomState {
@@ -252,14 +252,22 @@ export const useRoomStore = create<RoomState>((set, get) => ({
         keyPair = useKeysStore.getState().getKeyPair(roomId);
       }
       
+      // Verify our persisted key still matches what's on the server
+      if (keyPair) {
+        const me = await api.getMe();
+        const myMember = room.members.find(m => m.user_id === me.id);
+        if (myMember && myMember.public_key !== keyPair.publicKey) {
+          // Our persisted key doesn't match server - re-register it
+          await api.joinRoom(room.code, keyPair.publicKey);
+          room = await api.getRoom(roomId);
+        }
+      }
+      
       // If we still don't have a key pair, generate one and join/rejoin
       if (!keyPair) {
         keyPair = generateKeyPair();
-        // Join/rejoin to register our public key
         await api.joinRoom(room.code, keyPair.publicKey);
-        // Reload room to get updated member list with our new public key
         room = await api.getRoom(roomId);
-        // Persist the new key pair
         useKeysStore.getState().setKeyPair(roomId, keyPair);
       }
       
@@ -271,6 +279,12 @@ export const useRoomStore = create<RoomState>((set, get) => ({
           sharedSecrets.set(member.user_id, secret);
         }
       }
+      
+      console.log("[E2E] My public key:", keyPair.publicKey.substring(0, 12) + "...",
+        "Peers:", room.members
+          .filter(m => m.public_key !== keyPair!.publicKey)
+          .map(m => ({ user: m.display_name, key: m.public_key?.substring(0, 12) + "..." })),
+        "Secrets derived:", sharedSecrets.size);
       
       set({ 
         currentRoom: room, 
@@ -357,12 +371,25 @@ export const useRoomStore = create<RoomState>((set, get) => ({
   },
 
   _handleChatMessage: (message: ChatMessage) => {
-    const { sharedSecrets, currentRoom } = get();
-    const sharedSecret = sharedSecrets.get(message.sender_id);
+    const { sharedSecrets, currentRoom, keyPair } = get();
+    let sharedSecret = sharedSecrets.get(message.sender_id);
+    
+    console.log("[E2E Debug] sender_id:", message.sender_id, 
+      "secrets keys:", Array.from(sharedSecrets.keys()),
+      "has secret:", !!sharedSecret);
     
     if (!sharedSecret) {
-      console.error("No shared secret for sender");
-      return;
+      // Try to derive on the fly from room member's public key
+      const senderMember = currentRoom?.members.find(m => m.user_id === message.sender_id);
+      if (senderMember?.public_key && keyPair) {
+        sharedSecret = deriveSharedSecret(keyPair.secretKey, senderMember.public_key);
+        const newSecrets = new Map(sharedSecrets);
+        newSecrets.set(message.sender_id, sharedSecret);
+        set({ sharedSecrets: newSecrets });
+      } else {
+        console.warn("No shared secret for sender:", message.sender_id);
+        return;
+      }
     }
     
     const decrypted = decryptMessage(
@@ -371,7 +398,42 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     );
     
     if (!decrypted) {
-      console.error("Failed to decrypt message");
+      // Shared secret mismatch - try refreshing room data
+      console.warn("Failed to decrypt message - keys may be stale");
+      api.getRoom(currentRoom!.id).then(freshRoom => {
+        const senderMember = freshRoom.members.find(m => m.user_id === message.sender_id);
+        if (senderMember?.public_key && keyPair) {
+          const freshSecret = deriveSharedSecret(keyPair.secretKey, senderMember.public_key);
+          const retryDecrypted = decryptMessage(
+            { ciphertext: message.encrypted_content, nonce: message.nonce },
+            freshSecret
+          );
+          if (retryDecrypted) {
+            // Update shared secrets and add message
+            const newSecrets = new Map(get().sharedSecrets);
+            newSecrets.set(message.sender_id, freshSecret);
+            
+            const myMember = freshRoom.members.find(m => m.public_key === keyPair.publicKey);
+            const decryptedMessage: DecryptedMessage = {
+              id: message.message_id,
+              senderId: message.sender_id,
+              senderName: message.sender_name,
+              content: retryDecrypted,
+              timestamp: new Date(message.timestamp),
+              isOwn: message.sender_id === myMember?.user_id,
+            };
+            
+            set((state) => {
+              if (state.messages.some(m => m.id === decryptedMessage.id)) return state;
+              return {
+                sharedSecrets: newSecrets,
+                currentRoom: freshRoom,
+                messages: [...state.messages, decryptedMessage],
+              };
+            });
+          }
+        }
+      }).catch(() => {});
       return;
     }
     
@@ -405,10 +467,41 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     
     set({ isConnecting: true });
     
+    // Retry connection up to 3 times with increasing delay (tunnels can be slow)
+    let connected = false;
+    for (let attempt = 0; attempt < 3 && !connected; attempt++) {
+      try {
+        if (attempt > 0) {
+          await new Promise(r => setTimeout(r, 1000 * attempt));
+        }
+        await wsClient.connect(currentRoom.id);
+        connected = true;
+      } catch {
+        if (attempt === 2) {
+          console.warn("WebSocket connection failed after 3 attempts, relying on auto-reconnect");
+        }
+      }
+    }
+    
     try {
-      // connect() handles cleanup of existing connection internally
-      await wsClient.connect(currentRoom.id);
-      
+      // After connecting, refresh room data to get latest public keys
+      // This handles the case where other users joined while we were connecting
+      if (connected) {
+        try {
+          const freshRoom = await api.getRoom(currentRoom.id);
+          const freshSecrets = new Map<string, Uint8Array>();
+          for (const member of freshRoom.members) {
+            if (member.public_key && keyPair && member.public_key !== keyPair.publicKey) {
+              const secret = deriveSharedSecret(keyPair.secretKey, member.public_key);
+              freshSecrets.set(member.user_id, secret);
+            }
+          }
+          set({ currentRoom: freshRoom, sharedSecrets: freshSecrets });
+        } catch {
+          // Non-fatal - we'll get updates via WebSocket events
+        }
+      }
+
       // Get my user ID to filter out own messages
       const myMember = currentRoom.members.find(m => m.public_key === keyPair?.publicKey);
       const myUserId = myMember?.user_id;

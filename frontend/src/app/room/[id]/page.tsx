@@ -15,7 +15,14 @@ import { SecurityBadge } from "@/components/room/SecurityBadge";
 import { ChatWindow } from "@/components/ChatWindow";
 import { PeerStatus } from "@/components/PeerStatus";
 import { Button } from "@/components/ui/button";
-import { AlertTriangle, UserMinus, UserPlus } from "lucide-react";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from "@/components/ui/sheet";
+import { AlertTriangle, UserMinus, UserPlus, Users } from "lucide-react";
 
 export default function RoomPage() {
   const params = useParams();
@@ -37,8 +44,8 @@ export default function RoomPage() {
   const [isPageLoading, setIsPageLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [hasInitialized, setHasInitialized] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  // Show toast when a user joins the room
   useEffect(() => {
     if (lastUserJoined) {
       toast(`${lastUserJoined} joined the room`, {
@@ -49,7 +56,6 @@ export default function RoomPage() {
     }
   }, [lastUserJoined, clearLastUserJoined]);
 
-  // Show toast when a user leaves the room
   useEffect(() => {
     if (lastUserLeft) {
       toast(`${lastUserLeft} left the room`, {
@@ -99,13 +105,11 @@ export default function RoomPage() {
     };
   }, [roomId, isAuthenticated, loadRoom, leaveRoom, router, hasInitialized, setLoading]);
 
-  // Don't render until loaded
   if (isPageLoading) return null;
 
-  /* ---------- Error (room not found) ---------- */
   if (error && !currentRoom) {
     return (
-      <div className="min-h-screen flex items-center justify-center p-8">
+      <div className="min-h-screen flex items-center justify-center p-4 sm:p-8">
         <div className="text-center max-w-md">
           <div className="p-4 bg-destructive/10 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
             <AlertTriangle className="h-8 w-8 text-destructive" />
@@ -120,23 +124,48 @@ export default function RoomPage() {
     );
   }
 
-  /* ---------- Room ---------- */
+  const sidebarContent = (
+    <div className="space-y-4">
+      <PeerStatus />
+      <VerifyIdentity />
+      <SecurityBadge />
+    </div>
+  );
+
   return (
-    <div className="h-screen flex flex-col overflow-hidden">
+    <div className="h-dvh flex flex-col overflow-hidden">
       <RoomHeader />
 
-      <main className="flex-1 px-4 lg:px-8 py-4 overflow-hidden">
+      {/* Mobile sidebar toggle */}
+      <div className="lg:hidden flex items-center justify-end px-3 py-1.5 border-b border-border bg-card/50">
+        <Sheet open={sidebarOpen} onOpenChange={setSidebarOpen}>
+          <SheetTrigger asChild>
+            <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs">
+              <Users className="h-3.5 w-3.5" />
+              Room Info
+            </Button>
+          </SheetTrigger>
+          <SheetContent side="right" className="w-[300px] sm:w-[360px] overflow-y-auto">
+            <SheetHeader>
+              <SheetTitle>Room Info</SheetTitle>
+            </SheetHeader>
+            <div className="mt-4">
+              {sidebarContent}
+            </div>
+          </SheetContent>
+        </Sheet>
+      </div>
+
+      <main className="flex-1 px-2 sm:px-4 lg:px-8 py-2 sm:py-4 overflow-hidden min-h-0">
         <div className="grid lg:grid-cols-4 gap-4 h-full">
-          {/* Left column - Chat (full height) */}
+          {/* Chat takes full width on mobile */}
           <div className="lg:col-span-3 h-full min-h-0">
             <ChatWindow className="h-full" />
           </div>
 
-          {/* Right column - Room info */}
-          <div className="lg:col-span-1 space-y-4 overflow-y-auto">
-            <PeerStatus />
-            <VerifyIdentity />
-            <SecurityBadge />
+          {/* Desktop sidebar only */}
+          <div className="hidden lg:block lg:col-span-1 space-y-4 overflow-y-auto">
+            {sidebarContent}
           </div>
         </div>
       </main>

@@ -9,9 +9,7 @@ import { Separator } from "@/components/ui/separator";
 import { ThemeToggle } from "@/components/ThemeToggle";
 
 interface AppHeaderProps {
-  /** Optional breadcrumb text shown after the logo separator */
   breadcrumb?: React.ReactNode;
-  /** Width class for the inner container (default: w-full) */
   maxWidth?: string;
 }
 
@@ -21,42 +19,43 @@ export function AppHeader({ breadcrumb, maxWidth = "w-full" }: AppHeaderProps) {
 
   return (
     <header className="bg-card border-b border-border">
-      <div className={`${maxWidth} px-6 lg:px-12 py-3 flex items-center justify-between`}>
+      <div className={`${maxWidth} px-3 sm:px-6 lg:px-12 py-2 sm:py-3 flex items-center justify-between`}>
         {/* Left: logo */}
-        <div className="flex items-center gap-3">
-          <Link href="/" className="flex items-center gap-2">
+        <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+          <Link href="/" className="flex items-center gap-2 shrink-0">
             <div className="p-1.5 bg-primary rounded-lg">
-              <Lock className="h-5 w-5 text-primary-foreground" />
+              <Lock className="h-4 w-4 sm:h-5 sm:w-5 text-primary-foreground" />
             </div>
-            <span className="font-bold text-foreground">Cloudless</span>
+            <span className="font-bold text-foreground text-sm sm:text-base">Cloudless</span>
           </Link>
 
           {breadcrumb && (
             <>
-              <Separator orientation="vertical" className="h-6" />
-              <div className="text-sm text-muted-foreground">{breadcrumb}</div>
+              <Separator orientation="vertical" className="h-5 sm:h-6 hidden sm:block" />
+              <div className="text-xs sm:text-sm text-muted-foreground truncate hidden sm:block">{breadcrumb}</div>
             </>
           )}
         </div>
 
         {/* Right: user actions + theme toggle */}
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-1.5 sm:gap-3">
           {user && (
             <>
-              <span className="text-sm text-muted-foreground hidden sm:inline">
+              <span className="text-sm text-muted-foreground hidden md:inline">
                 {user.display_name}
               </span>
-              <Button variant="ghost" size="icon" onClick={() => router.push("/settings")} aria-label="Settings">
+              <Button variant="ghost" size="icon" className="h-8 w-8 sm:h-9 sm:w-9" onClick={() => router.push("/settings")} aria-label="Settings">
                 <Settings className="h-4 w-4" />
               </Button>
-              <Button variant="ghost" size="sm" className="text-destructive hover:text-destructive" onClick={logout}>
-                <LogOut className="h-4 w-4 mr-1" />
-                <span className="hidden sm:inline">Sign Out</span>
+              <Button variant="ghost" size="icon" className="h-8 w-8 sm:h-9 sm:w-9 text-destructive hover:text-destructive" onClick={logout} aria-label="Sign Out">
+                <LogOut className="h-4 w-4" />
               </Button>
-              <Separator orientation="vertical" className="h-6" />
+              <Separator orientation="vertical" className="h-5 sm:h-6 hidden sm:block" />
             </>
           )}
-          <ThemeToggle />
+          <div className="hidden sm:block">
+            <ThemeToggle />
+          </div>
         </div>
       </div>
     </header>

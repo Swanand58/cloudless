@@ -12,8 +12,8 @@ function SettingsPage() {
     <div className="min-h-screen flex flex-col">
       <AppHeader breadcrumb="Settings" />
 
-      <main className="flex-1 px-6 lg:px-12 py-8">
-        <div className="grid lg:grid-cols-2 gap-6">
+      <main className="flex-1 px-4 sm:px-6 lg:px-12 py-4 sm:py-8">
+        <div className="grid sm:grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
           <ProfileCard />
           <ChangePassword />
           <AdminInviteManagement />

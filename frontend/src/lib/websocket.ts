@@ -141,8 +141,8 @@ export class WebSocketClient {
         };
 
         this.ws.onerror = (error) => {
-          console.error("WebSocket error:", error);
-          // Only reject if we haven't resolved yet
+          // Only reject if we haven't resolved yet; don't log loudly
+          // since reconnection will handle recovery
           if (!resolved) {
             reject(error);
           }

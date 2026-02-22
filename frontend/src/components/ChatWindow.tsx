@@ -28,6 +28,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Lock, MessageCircle, Send, Paperclip, X } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { FileBubble } from "./FileBubble";
 
@@ -115,8 +116,22 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
   );
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chatItems]);
+    // Small delay to allow DOM to render new items before scrolling
+    const timer = setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, 50);
+    return () => clearTimeout(timer);
+  }, [chatItems.length]);
+
+  // Poll for new transfers every 10 seconds as fallback
+  // (WebSocket new_transfer event may be missed through tunnels)
+  useEffect(() => {
+    if (!currentRoom) return;
+    const interval = setInterval(() => {
+      loadTransfers();
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [currentRoom, loadTransfers]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -233,6 +248,8 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
           return m;
         });
 
+        toast.success("File sent successfully");
+
         // Remove from active after a moment and refresh transfers
         setTimeout(() => {
           setActiveTransfers((prev) => {
@@ -244,7 +261,9 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
 
         await loadTransfers();
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Upload failed");
+        const errorMsg = err instanceof Error ? err.message : "Upload failed";
+        setError(errorMsg);
+        toast.error(`File upload failed: ${errorMsg}`);
         setActiveTransfers((prev) => {
           const m = new Map(prev);
           m.delete(tempId);
@@ -390,14 +409,14 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
   return (
     <Card className={cn("flex flex-col", className)}>
       {/* Header */}
-      <div className="px-4 py-3 border-b border-border shrink-0">
-        <div className="flex items-center gap-2">
-          <MessageCircle className="h-4 w-4 text-muted-foreground" />
-          <span className="font-medium text-foreground text-sm">
+      <div className="px-3 sm:px-4 py-2 sm:py-3 border-b border-border shrink-0">
+        <div className="flex items-center gap-1.5 sm:gap-2">
+          <MessageCircle className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground" />
+          <span className="font-medium text-foreground text-xs sm:text-sm">
             Encrypted Chat
           </span>
-          <span className="text-xs text-green-600 dark:text-green-400 flex items-center gap-1 ml-1">
-            <Lock className="h-3 w-3" />
+          <span className="text-[10px] sm:text-xs text-green-600 dark:text-green-400 flex items-center gap-0.5 ml-1">
+            <Lock className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
             E2E
           </span>
         </div>
@@ -421,12 +440,12 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
       )}
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      <div className="flex-1 overflow-y-auto p-2 sm:p-4 space-y-3 sm:space-y-4">
         {chatItems.length === 0 ? (
           <div className="text-center text-muted-foreground py-8">
-            <MessageCircle className="h-12 w-12 mx-auto mb-2 opacity-40" />
-            <p>No messages yet</p>
-            <p className="text-sm">Start a secure conversation</p>
+            <MessageCircle className="h-10 w-10 sm:h-12 sm:w-12 mx-auto mb-2 opacity-40" />
+            <p className="text-sm sm:text-base">No messages yet</p>
+            <p className="text-xs sm:text-sm">Start a secure conversation</p>
           </div>
         ) : (
           chatItems.map(renderChatItem)
@@ -453,9 +472,9 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
       {/* Input */}
       <form
         onSubmit={handleSubmit}
-        className="p-3 border-t border-border shrink-0"
+        className="p-2 sm:p-3 border-t border-border shrink-0 safe-bottom"
       >
-        <div className="flex gap-2 items-center">
+        <div className="flex gap-1.5 sm:gap-2 items-center">
           {/* Attachment button */}
           <Button
             type="button"
@@ -513,21 +532,21 @@ function MessageBubble({
     >
       <div
         className={cn(
-          "max-w-[85%] sm:max-w-[70%] rounded-lg px-4 py-2",
+          "max-w-[80%] sm:max-w-[70%] rounded-lg px-3 py-1.5 sm:px-4 sm:py-2",
           message.isOwn
             ? "bg-primary text-primary-foreground"
             : "bg-muted text-foreground",
         )}
       >
         {!message.isOwn && (
-          <p className="text-xs font-medium opacity-75 mb-1">
+          <p className="text-[11px] sm:text-xs font-medium opacity-75 mb-0.5">
             {message.senderName}
           </p>
         )}
-        <p className="wrap-break-word whitespace-pre-wrap">{message.content}</p>
+        <p className="wrap-break-word whitespace-pre-wrap text-sm sm:text-base">{message.content}</p>
         <p
           className={cn(
-            "text-xs mt-1",
+            "text-[10px] sm:text-xs mt-0.5",
             message.isOwn
               ? "text-primary-foreground/70"
               : "text-muted-foreground",

@@ -54,20 +54,20 @@ export default function RegisterPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-8 relative">
+    <div className="min-h-dvh flex items-center justify-center px-4 py-8 sm:p-8 relative">
       {/* Theme toggle in top-right */}
-      <div className="absolute top-4 right-4">
+      <div className="absolute top-3 right-3 sm:top-4 sm:right-4">
         <ThemeToggle />
       </div>
 
       <div className="max-w-md w-full">
         {/* Logo */}
-        <div className="text-center mb-8">
+        <div className="text-center mb-6 sm:mb-8">
           <Link href="/" className="inline-flex items-center gap-3">
             <div className="p-2 bg-primary rounded-lg">
-              <Lock className="h-8 w-8 text-primary-foreground" />
+              <Lock className="h-7 w-7 sm:h-8 sm:w-8 text-primary-foreground" />
             </div>
-            <span className="text-2xl font-bold text-foreground">Cloudless</span>
+            <span className="text-xl sm:text-2xl font-bold text-foreground">Cloudless</span>
           </Link>
         </div>
 

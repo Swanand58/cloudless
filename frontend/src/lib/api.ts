@@ -383,7 +383,8 @@ class ApiClient {
   async uploadChunk(
     transferId: string,
     chunkIndex: number,
-    chunk: Blob
+    chunk: Blob,
+    maxRetries: number = 3
   ): Promise<{
     transfer_id: string;
     chunk_index: number;
@@ -391,28 +392,45 @@ class ApiClient {
     total_chunks: number;
     status: string;
   }> {
-    const formData = new FormData();
-    formData.append("chunk", chunk);
-
     const url = `${API_BASE}/api/transfers/${transferId}/chunks/${chunkIndex}`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.accessToken}`,
-      },
-      body: formData,
-    });
+    
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 60000);
+        
+        const formData = new FormData();
+        formData.append("chunk", chunk);
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new ApiError(
-        error.detail || "Upload failed",
-        response.status,
-        error.detail
-      );
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.accessToken}`,
+          },
+          body: formData,
+          signal: controller.signal,
+        });
+        
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new ApiError(
+            error.detail || "Upload failed",
+            response.status,
+            error.detail
+          );
+        }
+
+        return response.json();
+      } catch (err) {
+        if (attempt === maxRetries) throw err;
+        // Wait before retry with exponential backoff
+        await this.sleep(1000 * (attempt + 1));
+      }
     }
-
-    return response.json();
+    
+    throw new ApiError("Upload failed after retries", 0);
   }
 
   async getTransfer(transferId: string): Promise<TransferResponse> {

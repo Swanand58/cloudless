@@ -41,6 +41,12 @@ coverage/
 .coverage
 htmlcov/
 
+# Local deploy scripts
+start.sh
+stop.sh
+.pids/
+.logs/
+
 # Misc
 *.bak
 *.tmp

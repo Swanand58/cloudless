@@ -1,88 +1,172 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Cloudless - Start Script
-# This script starts both backend and frontend servers
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PID_DIR="$SCRIPT_DIR/.pids"
+LOG_DIR="$SCRIPT_DIR/.logs"
 
-set -e
+mkdir -p "$PID_DIR" "$LOG_DIR"
 
-echo "======================================"
-echo "   Cloudless - Secure File Transfer   "
-echo "======================================"
-echo ""
-
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+BOLD='\033[1m'
+NC='\033[0m'
 
-# Check if running from correct directory
-if [ ! -d "backend" ] || [ ! -d "frontend" ]; then
-    echo -e "${RED}Error: Please run this script from the cloudless root directory${NC}"
+cleanup_on_error() {
+  echo -e "\n${RED}Error occurred. Cleaning up...${NC}"
+  bash "$SCRIPT_DIR/stop.sh" 2>/dev/null || true
+  exit 1
+}
+trap cleanup_on_error ERR
+
+echo -e "${BOLD}${CYAN}"
+echo "  ╔═══════════════════════════════════════╗"
+echo "  ║         ☁  Cloudless Deploy  ☁        ║"
+echo "  ╚═══════════════════════════════════════╝"
+echo -e "${NC}"
+
+# --- Pre-flight checks ---
+echo -e "${BOLD}[1/5] Pre-flight checks${NC}"
+
+if ! command -v docker &>/dev/null; then
+  echo -e "${RED}  ✗ Docker not found. Install Docker Desktop first.${NC}" && exit 1
+fi
+if ! docker info &>/dev/null 2>&1; then
+  echo -e "${RED}  ✗ Docker daemon not running. Start Docker Desktop first.${NC}" && exit 1
+fi
+echo -e "${GREEN}  ✓ Docker${NC}"
+
+if ! command -v node &>/dev/null; then
+  echo -e "${RED}  ✗ Node.js not found.${NC}" && exit 1
+fi
+echo -e "${GREEN}  ✓ Node.js $(node -v)${NC}"
+
+if ! command -v cloudflared &>/dev/null; then
+  echo -e "${RED}  ✗ cloudflared not found. Install: brew install cloudflared${NC}" && exit 1
+fi
+echo -e "${GREEN}  ✓ cloudflared${NC}"
+
+# Check if already running
+if [ -f "$PID_DIR/backend.pid" ] || [ -f "$PID_DIR/tunnel.pid" ] || [ -f "$PID_DIR/frontend.pid" ]; then
+  echo -e "${YELLOW}  ⚠ Previous session detected. Stopping first...${NC}"
+  bash "$SCRIPT_DIR/stop.sh" 2>/dev/null || true
+  sleep 2
+fi
+
+# --- Backend ---
+echo -e "\n${BOLD}[2/5] Starting backend (Docker)${NC}"
+cd "$SCRIPT_DIR"
+docker compose up -d --build backend > "$LOG_DIR/backend.log" 2>&1
+echo "docker" > "$PID_DIR/backend.pid"
+
+echo -n "  Waiting for backend health check"
+for i in $(seq 1 30); do
+  if curl -sf http://localhost:8000/api/health > /dev/null 2>&1; then
+    echo -e "\n${GREEN}  ✓ Backend healthy at http://localhost:8000${NC}"
+    break
+  fi
+  echo -n "."
+  sleep 2
+  if [ "$i" -eq 30 ]; then
+    echo -e "\n${RED}  ✗ Backend failed to start. Check: docker compose logs backend${NC}"
     exit 1
-fi
+  fi
+done
 
-# Check for required tools
-command -v uv >/dev/null 2>&1 || { echo -e "${RED}Error: uv is not installed. Install from https://docs.astral.sh/uv/${NC}"; exit 1; }
-command -v node >/dev/null 2>&1 || { echo -e "${RED}Error: Node.js is not installed${NC}"; exit 1; }
+# --- Cloudflare Tunnel for backend ---
+echo -e "\n${BOLD}[3/5] Starting Cloudflare Tunnel (backend)${NC}"
+cloudflared tunnel --url http://localhost:8000 > "$LOG_DIR/tunnel.log" 2>&1 &
+TUNNEL_PID=$!
+echo "$TUNNEL_PID" > "$PID_DIR/tunnel.pid"
 
-echo -e "${GREEN}Starting backend...${NC}"
-cd backend
+echo -n "  Waiting for tunnel URL"
+BACKEND_TUNNEL_URL=""
+for i in $(seq 1 30); do
+  BACKEND_TUNNEL_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG_DIR/tunnel.log" 2>/dev/null | head -1 || true)
+  if [ -n "$BACKEND_TUNNEL_URL" ]; then
+    echo -e "\n${GREEN}  ✓ Backend tunnel: ${BOLD}${BACKEND_TUNNEL_URL}${NC}"
+    break
+  fi
+  echo -n "."
+  sleep 2
+  if [ "$i" -eq 30 ]; then
+    echo -e "\n${RED}  ✗ Tunnel failed to start. Check: cat $LOG_DIR/tunnel.log${NC}"
+    exit 1
+  fi
+done
 
-# Create .env if it doesn't exist
-if [ ! -f ".env" ]; then
-    echo -e "${YELLOW}Creating backend .env file...${NC}"
-    cp .env.example .env
-    # Generate secure secret key
-    SECRET_KEY=$(openssl rand -hex 32 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(32))")
-    sed -i.bak "s/your-secret-key-here-generate-with-openssl-rand-hex-32/$SECRET_KEY/" .env
-    rm -f .env.bak
-    echo -e "${GREEN}Generated secure SECRET_KEY${NC}"
-fi
+# --- Update frontend .env.local with tunnel URL ---
+echo -e "\n${BOLD}[4/5] Starting frontend (Next.js dev)${NC}"
+echo "NEXT_PUBLIC_API_URL=${BACKEND_TUNNEL_URL}" > "$SCRIPT_DIR/frontend/.env.local"
+echo -e "${GREEN}  ✓ Frontend .env.local updated with tunnel URL${NC}"
 
-# Start backend in background
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 &
-BACKEND_PID=$!
-echo -e "${GREEN}Backend started (PID: $BACKEND_PID)${NC}"
+cd "$SCRIPT_DIR/frontend"
 
-cd ../frontend
-
-# Create .env.local if it doesn't exist
-if [ ! -f ".env.local" ]; then
-    echo -e "${YELLOW}Creating frontend .env.local file...${NC}"
-    cp .env.local.example .env.local
-fi
-
-# Install dependencies if needed
 if [ ! -d "node_modules" ]; then
-    echo -e "${YELLOW}Installing frontend dependencies...${NC}"
-    npm install
+  echo "  Installing dependencies..."
+  npm install > "$LOG_DIR/npm-install.log" 2>&1
 fi
 
-echo -e "${GREEN}Starting frontend...${NC}"
-npm run dev &
+npx next dev --port 3000 > "$LOG_DIR/frontend.log" 2>&1 &
 FRONTEND_PID=$!
-echo -e "${GREEN}Frontend started (PID: $FRONTEND_PID)${NC}"
+echo "$FRONTEND_PID" > "$PID_DIR/frontend.pid"
 
-echo ""
-echo "======================================"
-echo -e "${GREEN}Cloudless is running!${NC}"
-echo "======================================"
-echo ""
-echo "  Backend:  http://localhost:8000"
-echo "  Frontend: http://localhost:3000"
-echo "  API Docs: http://localhost:8000/docs (debug mode only)"
-echo ""
-echo "  Default admin login:"
-echo "    Username: admin"
-echo "    Password: changeme123"
-echo ""
-echo -e "${YELLOW}IMPORTANT: Change the admin password immediately!${NC}"
-echo ""
-echo "Press Ctrl+C to stop both servers"
+echo -n "  Waiting for frontend"
+for i in $(seq 1 30); do
+  if curl -sf http://localhost:3000 > /dev/null 2>&1; then
+    echo -e "\n${GREEN}  ✓ Frontend running at http://localhost:3000${NC}"
+    break
+  fi
+  echo -n "."
+  sleep 2
+  if [ "$i" -eq 30 ]; then
+    echo -e "\n${RED}  ✗ Frontend failed to start. Check: cat $LOG_DIR/frontend.log${NC}"
+    exit 1
+  fi
+done
 
-# Trap Ctrl+C and kill both processes
-trap "echo ''; echo 'Stopping servers...'; kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit 0" INT
+# --- Cloudflare Tunnel for frontend ---
+echo -e "\n${BOLD}[5/5] Starting Cloudflare Tunnel (frontend)${NC}"
+cloudflared tunnel --url http://localhost:3000 > "$LOG_DIR/tunnel-frontend.log" 2>&1 &
+TUNNEL_FE_PID=$!
+echo "$TUNNEL_FE_PID" > "$PID_DIR/tunnel-frontend.pid"
 
-# Wait for both processes
-wait
+echo -n "  Waiting for tunnel URL"
+FRONTEND_TUNNEL_URL=""
+for i in $(seq 1 30); do
+  FRONTEND_TUNNEL_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG_DIR/tunnel-frontend.log" 2>/dev/null | head -1 || true)
+  if [ -n "$FRONTEND_TUNNEL_URL" ]; then
+    echo -e "\n${GREEN}  ✓ Frontend tunnel: ${BOLD}${FRONTEND_TUNNEL_URL}${NC}"
+    break
+  fi
+  echo -n "."
+  sleep 2
+  if [ "$i" -eq 30 ]; then
+    echo -e "\n${RED}  ✗ Frontend tunnel failed. Check: cat $LOG_DIR/tunnel-frontend.log${NC}"
+    exit 1
+  fi
+done
+
+# --- Summary ---
+echo ""
+echo -e "${BOLD}${CYAN}═══════════════════════════════════════════${NC}"
+echo -e "${BOLD}${GREEN}  Cloudless is live!${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════${NC}"
+echo ""
+echo -e "  ${BOLD}Local access:${NC}"
+echo -e "    Frontend:  ${CYAN}http://localhost:3000${NC}"
+echo -e "    Backend:   ${CYAN}http://localhost:8000${NC}"
+echo ""
+echo -e "  ${BOLD}Share with friends:${NC}"
+echo -e "    App URL:   ${GREEN}${BOLD}${FRONTEND_TUNNEL_URL}${NC}"
+echo -e "    API URL:   ${GREEN}${BOLD}${BACKEND_TUNNEL_URL}${NC}"
+echo ""
+echo -e "  ${BOLD}Logs:${NC}"
+echo -e "    Backend:   ${LOG_DIR}/backend.log"
+echo -e "    Frontend:  ${LOG_DIR}/frontend.log"
+echo -e "    Tunnels:   ${LOG_DIR}/tunnel.log, tunnel-frontend.log"
+echo ""
+echo -e "  ${YELLOW}Run ${BOLD}./stop.sh${NC}${YELLOW} to shut everything down.${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════${NC}"

@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     upload_dir: Path = Path("./uploads")
     max_file_size_mb: int = 1024  # 1GB max
     file_expiry_hours: int = 24
-    chunk_size: int = 64 * 1024  # 64KB chunks
+    chunk_size: int = 512 * 1024  # 512KB chunks
 
     # Rate Limiting (increased for dev - frontend makes multiple API calls per page)
     rate_limit_requests: int = 300
