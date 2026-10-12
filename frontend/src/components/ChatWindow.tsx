@@ -1,44 +1,51 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
-import { useAuthStore } from "@/store/auth";
+import { useState, useRef, useEffect, useMemo, useCallback } from "react";
+import { useRoomStore, DecryptedMessage, getPeer } from "@/store/room";
+import { api, TransferResponse } from "@/lib/api";
 import {
-  useRoomStore,
-  DecryptedMessage,
-  useChatItems,
-  ChatItem,
-  FileTransferStatus,
-} from "@/store/room";
-import { api } from "@/lib/api";
-import {
-  encryptFilename,
-  encryptData,
-  decryptFilename,
-  decryptData,
-} from "@/lib/crypto";
-import {
-  readFileChunks,
-  formatFileSize,
   CHUNK_SIZE,
-  createDownloadBlob,
-  downloadFile,
-} from "@/lib/chunker";
+  MAX_FILE_SIZE,
+  FileMeta,
+  sealFile,
+  openStream,
+  sha256Hex,
+  sealMeta,
+  openMeta,
+} from "@/lib/filecrypt";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Lock, MessageCircle, Send, Paperclip, X } from "lucide-react";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { Lock, MessageCircle, Send, Paperclip, Download, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
-import { cn } from "@/lib/utils";
-import { FileBubble } from "./FileBubble";
+import { cn, formatFileSize, makeThumbnail, saveUrlAs } from "@/lib/utils";
+import { FileBubble, FileStatus } from "./FileBubble";
 
-interface ActiveTransfer {
+/** Formats every browser can show in an <img>. Anything else is saved to disk. */
+const VIEWABLE_IMAGE = /^image\/(jpeg|png|gif|webp|avif|bmp)$/;
+
+/** A file being uploaded from this browser; not on the server's list yet. */
+interface Upload {
   id: string;
-  filename: string;
+  name: string;
+  thumb?: string;
   fileSize: number;
-  status: FileTransferStatus;
+  timestamp: Date;
+  status: FileStatus;
   progress: number;
 }
+
+interface DownloadState {
+  status: FileStatus;
+  progress: number;
+}
+
+type TimelineItem =
+  | { kind: "text"; key: string; timestamp: Date; message: DecryptedMessage }
+  | { kind: "upload"; key: string; timestamp: Date; upload: Upload }
+  | { kind: "transfer"; key: string; timestamp: Date; transfer: TransferResponse; meta: FileMeta | null };
 
 interface ChatWindowProps {
   className?: string;
@@ -46,19 +53,19 @@ interface ChatWindowProps {
 
 export function ChatWindow({ className = "" }: ChatWindowProps) {
   const [message, setMessage] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [activeTransfers, setActiveTransfers] = useState<
-    Map<string, ActiveTransfer>
-  >(new Map());
-  const [decryptedFilenames, setDecryptedFilenames] = useState<
-    Map<string, string>
-  >(new Map());
+  const [uploads, setUploads] = useState<Record<string, Upload>>({});
+  const [downloads, setDownloads] = useState<Record<string, DownloadState>>({});
+  const [viewer, setViewer] = useState<{ url: string; name: string } | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const uploadCounter = useRef(0);
+  // Decrypted files opened this visit: transferId -> object URL.
+  // ponytail: never evicted while the room is open. Cap it if people start
+  // paging through dozens of 50 MB images in one sitting.
+  const objectUrls = useRef(new Map<string, string>());
 
-  const { user } = useAuthStore();
   const {
     messages,
     transfers,
@@ -66,54 +73,62 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
     sendMessage,
     setTyping,
     currentRoom,
-    keyPair,
-    sharedSecrets,
+    myUserId,
+    sharedSecret,
+    peerKeyChanged,
+    acceptPeerKey,
     loadTransfers,
   } = useRoomStore();
 
-  // Get my user ID
-  const myMember = currentRoom?.members.find(
-    (m) => m.public_key === keyPair?.publicKey,
-  );
-  const myUserId = myMember?.user_id;
+  const peer = getPeer(currentRoom, myUserId);
 
-  // Decrypt filenames when transfers or shared secrets change
+  // Release decrypted files when leaving the room
   useEffect(() => {
-    if (!sharedSecrets.size || !transfers.length) return;
+    const urls = objectUrls.current;
+    return () => {
+      urls.forEach((url) => URL.revokeObjectURL(url));
+      urls.clear();
+    };
+  }, []);
 
-    const [, sharedSecret] = Array.from(sharedSecrets.entries())[0];
-    const newDecryptedFilenames = new Map<string, string>();
+  // Decrypt file metadata whenever transfers or the key change
+  const metas = useMemo(() => {
+    const result = new Map<string, FileMeta | null>();
+    for (const transfer of transfers) {
+      result.set(
+        transfer.id,
+        sharedSecret ? openMeta(transfer.encrypted_meta, sharedSecret) : null
+      );
+    }
+    return result;
+  }, [transfers, sharedSecret]);
 
-    transfers.forEach((transfer) => {
-      if (decryptedFilenames.has(transfer.id)) {
-        newDecryptedFilenames.set(
-          transfer.id,
-          decryptedFilenames.get(transfer.id)!,
-        );
-        return;
-      }
-      try {
-        const filename = decryptFilename(
-          { ciphertext: transfer.encrypted_filename, nonce: transfer.nonce },
-          sharedSecret,
-        );
-        if (filename) newDecryptedFilenames.set(transfer.id, filename);
-      } catch {
-        // fallback
-      }
-    });
-
-    setDecryptedFilenames(newDecryptedFilenames);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [transfers, sharedSecrets]);
-
-  // Create unified chat items
-  const chatItems = useChatItems(
-    messages,
-    transfers,
-    myUserId,
-    decryptedFilenames,
-  );
+  // Messages, finished transfers and running uploads as one timeline
+  const timeline = useMemo(() => {
+    const items: TimelineItem[] = [
+      ...messages.map((m) => ({
+        kind: "text" as const,
+        key: m.id,
+        timestamp: m.timestamp,
+        message: m,
+      })),
+      ...transfers.map((t) => ({
+        kind: "transfer" as const,
+        key: `transfer-${t.id}`,
+        timestamp: new Date(t.created_at),
+        transfer: t,
+        meta: metas.get(t.id) ?? null,
+      })),
+      ...Object.values(uploads).map((u) => ({
+        kind: "upload" as const,
+        key: u.id,
+        timestamp: u.timestamp,
+        upload: u,
+      })),
+    ];
+    // Sort by timestamp ascending (oldest first, newest at bottom)
+    return items.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+  }, [messages, transfers, metas, uploads]);
 
   useEffect(() => {
     // Small delay to allow DOM to render new items before scrolling
@@ -121,24 +136,18 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }, 50);
     return () => clearTimeout(timer);
-  }, [chatItems.length]);
-
-  // Poll for new transfers every 10 seconds as fallback
-  // (WebSocket new_transfer event may be missed through tunnels)
-  useEffect(() => {
-    if (!currentRoom) return;
-    const interval = setInterval(() => {
-      loadTransfers();
-    }, 10000);
-    return () => clearInterval(interval);
-  }, [currentRoom, loadTransfers]);
+  }, [timeline.length]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (message.trim()) {
-      sendMessage(message.trim());
+    const text = message.trim();
+    if (!text) return;
+
+    if (sendMessage(text)) {
       setMessage("");
       setTyping(false);
+    } else {
+      toast.error("Not connected. Trying to reconnect...");
     }
   };
 
@@ -149,261 +158,187 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
     typingTimeoutRef.current = setTimeout(() => setTyping(false), 2000);
   };
 
-  const handleAttachClick = () => {
-    fileInputRef.current?.click();
-  };
-
-  const handleFileSelect = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-
-      // Reset file input
-      e.target.value = "";
-
-      if (!currentRoom || sharedSecrets.size === 0 || !keyPair) {
-        setError("No peer connected yet. Wait for someone to join.");
+  const uploadFile = useCallback(
+    async (file: File, roomId: string, key: Uint8Array) => {
+      if (file.size === 0) {
+        toast.error(`${file.name} is empty`);
+        return;
+      }
+      if (file.size > MAX_FILE_SIZE) {
+        toast.error(`${file.name} is over the ${formatFileSize(MAX_FILE_SIZE)} limit`);
         return;
       }
 
-      const [, sharedSecret] = Array.from(sharedSecrets.entries())[0];
-      const tempId = `temp-${Date.now()}`;
-
-      setActiveTransfers((prev) =>
-        new Map(prev).set(tempId, {
-          id: tempId,
-          filename: file.name,
-          fileSize: file.size,
-          status: "encrypting",
-          progress: 0,
-        }),
-      );
-
-      try {
-        const encryptedFilename = encryptFilename(file.name, sharedSecret);
-        const encryptedMimetype = encryptFilename(
-          file.type || "application/octet-stream",
-          sharedSecret,
-        );
-
-        const transfer = await api.initTransfer(
-          currentRoom.id,
-          encryptedFilename.ciphertext,
-          encryptedMimetype.ciphertext,
-          file.size,
-          encryptedFilename.nonce,
-          "relay",
-        );
-
-        // Store the decrypted filename
-        setDecryptedFilenames((prev) =>
-          new Map(prev).set(transfer.id, file.name),
-        );
-
-        setActiveTransfers((prev) => {
-          const m = new Map(prev);
-          m.delete(tempId);
-          m.set(transfer.id, {
-            id: transfer.id,
-            filename: file.name,
-            fileSize: file.size,
-            status: "uploading",
-            progress: 0,
-          });
-          return m;
+      const id = `upload-${++uploadCounter.current}`;
+      const update = (changes: Partial<Upload>) =>
+        setUploads((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], ...changes } } : prev));
+      const remove = () =>
+        setUploads((prev) => {
+          const next = { ...prev };
+          delete next[id];
+          return next;
         });
 
-        let chunkIndex = 0;
+      setUploads((prev) => ({
+        ...prev,
+        [id]: {
+          id,
+          name: file.name,
+          fileSize: file.size,
+          timestamp: new Date(),
+          status: "preparing",
+          progress: 0,
+        },
+      }));
+
+      let transferId: string | null = null;
+      try {
+        const [sha256, thumb] = await Promise.all([sha256Hex(file), makeThumbnail(file)]);
+        update({ thumb });
+
+        const meta: FileMeta = {
+          name: file.name,
+          type: file.type || "application/octet-stream",
+          sha256,
+          thumb,
+        };
+        const transfer = await api.initTransfer(roomId, sealMeta(meta, key), file.size);
+        transferId = transfer.id;
+        update({ status: "uploading" });
+
         const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-
-        for await (const { data } of readFileChunks(file, CHUNK_SIZE)) {
-          const { ciphertext, nonce } = encryptData(data, sharedSecret);
-          const combined = new Uint8Array(nonce.length + ciphertext.length);
-          combined.set(nonce);
-          combined.set(ciphertext, nonce.length);
-          await api.uploadChunk(transfer.id, chunkIndex, new Blob([combined]));
-          chunkIndex++;
-
-          setActiveTransfers((prev) => {
-            const current = prev.get(transfer.id);
-            if (!current) return prev;
-            const m = new Map(prev);
-            m.set(transfer.id, {
-              ...current,
-              progress: Math.round((chunkIndex / totalChunks) * 100),
-            });
-            return m;
-          });
+        let index = 0;
+        for await (const sealed of sealFile(file, key)) {
+          await api.uploadChunk(transfer.id, index++, sealed);
+          update({ progress: Math.round((index / totalChunks) * 100) });
         }
 
-        setActiveTransfers((prev) => {
-          const current = prev.get(transfer.id);
-          if (!current) return prev;
-          const m = new Map(prev);
-          m.set(transfer.id, {
-            ...current,
-            status: "completed",
-            progress: 100,
-          });
-          return m;
-        });
-
-        toast.success("File sent successfully");
-
-        // Remove from active after a moment and refresh transfers
-        setTimeout(() => {
-          setActiveTransfers((prev) => {
-            const m = new Map(prev);
-            m.delete(transfer.id);
-            return m;
-          });
-        }, 2000);
-
+        // The finished transfer now comes from the server's list
         await loadTransfers();
       } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : "Upload failed";
-        setError(errorMsg);
-        toast.error(`File upload failed: ${errorMsg}`);
-        setActiveTransfers((prev) => {
-          const m = new Map(prev);
-          m.delete(tempId);
-          return m;
-        });
+        toast.error(
+          `Could not send ${file.name}: ${err instanceof Error ? err.message : "upload failed"}`
+        );
+        // Do not leave a half-uploaded file on the server
+        if (transferId) api.cancelTransfer(transferId).catch(() => {});
+      } finally {
+        remove();
       }
     },
-    [currentRoom, sharedSecrets, keyPair, loadTransfers],
+    [loadTransfers]
   );
 
-  const handleDownload = useCallback(
-    async (transferId: string) => {
-      if (!sharedSecrets.size) return;
-      const [, sharedSecret] = Array.from(sharedSecrets.entries())[0];
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = ""; // Allow picking the same file again
+    if (!currentRoom || !sharedSecret) return;
 
-      try {
-        const transfer = await api.getTransfer(transferId);
-        const filename =
-          decryptFilename(
-            { ciphertext: transfer.encrypted_filename, nonce: transfer.nonce },
-            sharedSecret,
-          ) || "download";
+    // One at a time: steadier progress and memory than uploading in parallel
+    for (const file of files) {
+      await uploadFile(file, currentRoom.id, sharedSecret);
+    }
+  };
 
-        setActiveTransfers((prev) =>
-          new Map(prev).set(transferId, {
-            id: transferId,
-            filename,
-            fileSize: transfer.file_size,
-            status: "downloading",
-            progress: 0,
-          }),
-        );
+  const show = (url: string, meta: FileMeta) => {
+    if (VIEWABLE_IMAGE.test(meta.type)) {
+      setViewer({ url, name: meta.name });
+    } else {
+      saveUrlAs(url, meta.name);
+    }
+  };
 
-        const { data: blob } = await api.downloadFile(transferId);
-        const encryptedData = new Uint8Array(await blob.arrayBuffer());
+  const openTransfer = async (transfer: TransferResponse, meta: FileMeta) => {
+    if (!sharedSecret || downloads[transfer.id]?.status === "downloading") return;
 
-        setActiveTransfers((prev) => {
-          const current = prev.get(transferId);
-          if (!current) return prev;
-          const m = new Map(prev);
-          m.set(transferId, { ...current, status: "decrypting", progress: 50 });
-          return m;
-        });
+    const cached = objectUrls.current.get(transfer.id);
+    if (cached) {
+      show(cached, meta);
+      return;
+    }
 
-        // Each encrypted chunk is: nonce (24 bytes) + ciphertext (original + 16 byte auth tag)
-        // Original chunk size is CHUNK_SIZE (64KB), so encrypted chunk size is 24 + CHUNK_SIZE + 16
-        const nonceLength = 24;
-        const authTagLength = 16;
-        const encryptedChunkSize = nonceLength + CHUNK_SIZE + authTagLength;
-        
-        const decryptedChunks: Uint8Array[] = [];
-        let offset = 0;
+    const setState = (state: DownloadState | null) =>
+      setDownloads((prev) => {
+        const next = { ...prev };
+        if (state) next[transfer.id] = state;
+        else delete next[transfer.id];
+        return next;
+      });
 
-        while (offset < encryptedData.length) {
-          const nonce = encryptedData.slice(offset, offset + nonceLength);
-          
-          // The ciphertext is either a full chunk or the last partial chunk
-          const ciphertextEnd = Math.min(offset + encryptedChunkSize, encryptedData.length);
-          const ciphertext = encryptedData.slice(offset + nonceLength, ciphertextEnd);
-          
-          const decrypted = decryptData(ciphertext, nonce, sharedSecret);
-          if (!decrypted) {
-            throw new Error("Decryption failed");
-          }
-          decryptedChunks.push(decrypted);
-          
-          // Move to next chunk
-          offset = ciphertextEnd;
+    setState({ status: "downloading", progress: 0 });
+    try {
+      const { stream, totalBytes } = await api.downloadFile(transfer.id);
+
+      let lastPercent = 0;
+      const chunks = await openStream(stream, sharedSecret, (received) => {
+        const percent = totalBytes ? Math.floor((received / totalBytes) * 100) : 0;
+        // Network reads arrive far more often than the bar needs to move
+        if (percent !== lastPercent) {
+          lastPercent = percent;
+          setState({ status: "downloading", progress: percent });
         }
+      });
 
-        if (decryptedChunks.length === 0) throw new Error("No data decrypted");
-
-        const totalLength = decryptedChunks.reduce(
-          (sum, c) => sum + c.length,
-          0,
-        );
-        const result = new Uint8Array(totalLength);
-        let ro = 0;
-        for (const chunk of decryptedChunks) {
-          result.set(chunk, ro);
-          ro += chunk.length;
-        }
-
-        downloadFile(createDownloadBlob(result), filename);
-
-        setActiveTransfers((prev) => {
-          const current = prev.get(transferId);
-          if (!current) return prev;
-          const m = new Map(prev);
-          m.set(transferId, { ...current, status: "completed", progress: 100 });
-          return m;
-        });
-
-        // Remove from active after a moment
-        setTimeout(() => {
-          setActiveTransfers((prev) => {
-            const m = new Map(prev);
-            m.delete(transferId);
-            return m;
-          });
-        }, 2000);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Download failed");
-        setActiveTransfers((prev) => {
-          const current = prev.get(transferId);
-          if (!current) return prev;
-          const m = new Map(prev);
-          m.set(transferId, { ...current, status: "error" });
-          return m;
-        });
+      // The type comes from the sender; only trust it for formats we display
+      const blob = new Blob(chunks as BlobPart[], {
+        type: VIEWABLE_IMAGE.test(meta.type) ? meta.type : "application/octet-stream",
+      });
+      if ((await sha256Hex(blob)) !== meta.sha256) {
+        throw new Error("File failed its integrity check");
       }
-    },
-    [sharedSecrets],
-  );
+
+      const url = URL.createObjectURL(blob);
+      objectUrls.current.set(transfer.id, url);
+      setState(null);
+      show(url, meta);
+    } catch (err) {
+      setState({ status: "error", progress: 0 });
+      toast.error(
+        `Could not open ${meta.name}: ${err instanceof Error ? err.message : "download failed"}`
+      );
+    }
+  };
 
   const typingNames = Array.from(typingUsers.values());
-  const canSendFiles = sharedSecrets.size > 0;
+  const canSend = !!sharedSecret;
 
-  const renderChatItem = (item: ChatItem) => {
-    if (item.type === "text") {
-      return (
-        <MessageBubble
-          key={item.id}
-          message={item as unknown as DecryptedMessage & { content: string }}
-        />
-      );
-    } else {
-      const activeTransfer = item.transferId
-        ? activeTransfers.get(item.transferId)
-        : undefined;
+  const renderItem = (item: TimelineItem) => {
+    if (item.kind === "text") {
+      return <MessageBubble key={item.key} message={item.message} />;
+    }
+
+    if (item.kind === "upload") {
+      const { upload } = item;
       return (
         <FileBubble
-          key={item.id}
-          item={item}
-          onDownload={handleDownload}
-          activeStatus={activeTransfer?.status}
-          activeProgress={activeTransfer?.progress}
+          key={item.key}
+          name={upload.name}
+          thumb={upload.thumb}
+          fileSize={upload.fileSize}
+          senderName=""
+          timestamp={upload.timestamp}
+          isOwn
+          status={upload.status}
+          progress={upload.progress}
         />
       );
     }
+
+    const { transfer, meta } = item;
+    const download = downloads[transfer.id];
+    return (
+      <FileBubble
+        key={item.key}
+        name={meta?.name}
+        thumb={meta?.thumb}
+        fileSize={transfer.file_size}
+        senderName={transfer.sender_name}
+        timestamp={item.timestamp}
+        isOwn={transfer.sender_id === myUserId}
+        status={download?.status ?? "ready"}
+        progress={download?.progress}
+        onOpen={meta ? () => openTransfer(transfer, meta) : undefined}
+      />
+    );
   };
 
   return (
@@ -413,7 +348,7 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
         <div className="flex items-center gap-1.5 sm:gap-2">
           <MessageCircle className="h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground" />
           <span className="font-medium text-foreground text-xs sm:text-sm">
-            Encrypted Chat
+            {peer ? peer.display_name : "Encrypted Chat"}
           </span>
           <span className="text-[10px] sm:text-xs text-green-600 dark:text-green-400 flex items-center gap-0.5 ml-1">
             <Lock className="h-2.5 w-2.5 sm:h-3 sm:w-3" />
@@ -422,18 +357,19 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
         </div>
       </div>
 
-      {/* Error */}
-      {error && (
-        <Alert variant="destructive" className="mx-4 mt-3">
-          <AlertDescription className="flex items-center justify-between">
-            <span>{error}</span>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-6 w-6"
-              onClick={() => setError(null)}
-            >
-              <X className="h-4 w-4" />
+      {/* The other person's key is not the one we saw before */}
+      {peerKeyChanged && peer && (
+        <Alert variant="destructive" className="mx-2 sm:mx-4 mt-3 w-auto">
+          <ShieldAlert className="h-4 w-4" />
+          <AlertDescription className="space-y-2">
+            <p>
+              {peer.display_name}&apos;s security key has changed. This happens when
+              someone clears their browser or switches device, and older messages
+              and files may no longer open. Verify their identity before sending
+              anything sensitive.
+            </p>
+            <Button variant="outline" size="sm" onClick={acceptPeerKey}>
+              Continue with the new key
             </Button>
           </AlertDescription>
         </Alert>
@@ -441,14 +377,14 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-2 sm:p-4 space-y-3 sm:space-y-4">
-        {chatItems.length === 0 ? (
+        {timeline.length === 0 ? (
           <div className="text-center text-muted-foreground py-8">
             <MessageCircle className="h-10 w-10 sm:h-12 sm:w-12 mx-auto mb-2 opacity-40" />
             <p className="text-sm sm:text-base">No messages yet</p>
-            <p className="text-xs sm:text-sm">Start a secure conversation</p>
+            <p className="text-xs sm:text-sm">Send a message or a photo</p>
           </div>
         ) : (
-          chatItems.map(renderChatItem)
+          timeline.map(renderItem)
         )}
         <div ref={messagesEndRef} />
       </div>
@@ -456,16 +392,14 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
       {/* Typing indicator */}
       {typingNames.length > 0 && (
         <div className="px-4 py-1 text-sm text-muted-foreground shrink-0">
-          {typingNames.length === 1
-            ? `${typingNames[0]} is typing...`
-            : `${typingNames.join(", ")} are typing...`}
+          {typingNames.join(", ")} {typingNames.length === 1 ? "is" : "are"} typing...
         </div>
       )}
 
       {/* Peer warning */}
-      {!canSendFiles && (
+      {!canSend && (
         <div className="px-4 py-2 text-sm text-yellow-600 dark:text-yellow-400 bg-yellow-500/10 shrink-0">
-          Waiting for another person to join before you can send files...
+          Waiting for the other person to join. Share the room code with them.
         </div>
       )}
 
@@ -480,19 +414,19 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
             type="button"
             variant="ghost"
             size="icon"
-            onClick={handleAttachClick}
-            disabled={!canSendFiles}
+            onClick={() => fileInputRef.current?.click()}
+            disabled={!canSend}
             className="shrink-0"
-            aria-label="Attach file"
+            aria-label="Attach photos or files"
           >
             <Paperclip className="h-5 w-5" />
           </Button>
           <input
             ref={fileInputRef}
             type="file"
+            multiple
             onChange={handleFileSelect}
             className="hidden"
-            accept="*/*"
           />
 
           {/* Text input */}
@@ -500,6 +434,8 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
             value={message}
             onChange={handleInputChange}
             placeholder="Type a message..."
+            disabled={!canSend}
+            maxLength={4000}
             className="flex-1"
           />
 
@@ -507,22 +443,45 @@ export function ChatWindow({ className = "" }: ChatWindowProps) {
           <Button
             type="submit"
             size="icon"
-            disabled={!message.trim()}
+            disabled={!canSend || !message.trim()}
             className="shrink-0"
+            aria-label="Send message"
           >
             <Send className="h-4 w-4" />
           </Button>
         </div>
       </form>
+
+      {/* Full-size image viewer */}
+      <Dialog open={!!viewer} onOpenChange={(open) => !open && setViewer(null)}>
+        <DialogContent className="sm:max-w-4xl p-3 gap-3">
+          <DialogTitle className="truncate pr-8 text-sm">{viewer?.name}</DialogTitle>
+          {viewer && (
+            <>
+              {/* A local blob URL: next/image cannot load or optimize it */}
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={viewer.url}
+                alt={viewer.name}
+                className="max-h-[75dvh] w-full object-contain rounded-md"
+              />
+              <Button
+                variant="secondary"
+                className="w-full sm:w-auto sm:ml-auto"
+                onClick={() => saveUrlAs(viewer.url, viewer.name)}
+              >
+                <Download className="h-4 w-4 mr-1.5" />
+                Save
+              </Button>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }
 
-function MessageBubble({
-  message,
-}: {
-  message: DecryptedMessage & { content: string };
-}) {
+function MessageBubble({ message }: { message: DecryptedMessage }) {
   const formatTime = (date: Date) =>
     date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
@@ -543,7 +502,11 @@ function MessageBubble({
             {message.senderName}
           </p>
         )}
-        <p className="wrap-break-word whitespace-pre-wrap text-sm sm:text-base">{message.content}</p>
+        {message.unreadable ? (
+          <p className="text-sm italic opacity-75">Encrypted with a previous key</p>
+        ) : (
+          <p className="wrap-break-word whitespace-pre-wrap text-sm sm:text-base">{message.content}</p>
+        )}
         <p
           className={cn(
             "text-[10px] sm:text-xs mt-0.5",

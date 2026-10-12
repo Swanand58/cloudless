@@ -2,25 +2,26 @@
 
 import os
 import aiofiles
-from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Response
+from datetime import datetime, timezone
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
+from sqlalchemy import select, func
 
 from app.config import settings
-from app.database import get_db, async_session
+from app.database import get_db
 from app.models.user import User
-from app.models.room import Room, RoomMember
-from app.models.user import User as UserModel
-from app.models.transfer import FileTransfer, TransferStatus, TransferMode, generate_transfer_id
+from app.models.transfer import FileTransfer, TransferStatus, generate_transfer_id
 from app.routers.auth import get_current_user
-from app.services.crypto import crypto_service
+from app.routers.rooms import verify_room_membership
 from app.routers.websocket import manager as ws_manager
+from app.services.cleanup import delete_transfer
 
 router = APIRouter(prefix="/transfers", tags=["transfers"])
+
+# Each stored chunk is nonce (24 bytes) + ciphertext + auth tag (16 bytes)
+MAX_SEALED_CHUNK_SIZE = settings.chunk_size + 40
 
 
 # Request/Response models
@@ -28,15 +29,12 @@ class InitTransferRequest(BaseModel):
     """Initialize transfer request body."""
 
     room_id: str
-    encrypted_filename: str = Field(..., description="Base64 encoded encrypted filename")
-    encrypted_mimetype: str | None = Field(
-        default=None, description="Base64 encoded encrypted mimetype"
+    encrypted_meta: str = Field(
+        ...,
+        max_length=200_000,
+        description="Base64 encoded encrypted metadata (name, type, hash, thumbnail)",
     )
     file_size: int = Field(..., gt=0, le=settings.max_file_size_mb * 1024 * 1024)
-    nonce: str = Field(..., description="Base64 encoded nonce for encryption")
-    mode: str = Field(default="relay", pattern="^(p2p|relay)$")
-    expires_in_hours: int | None = Field(default=24, ge=1, le=168)
-    max_downloads: int = Field(default=9999, ge=1, le=9999)
 
 
 class TransferResponse(BaseModel):
@@ -46,18 +44,11 @@ class TransferResponse(BaseModel):
     room_id: str
     sender_id: str
     sender_name: str
-    encrypted_filename: str
-    encrypted_mimetype: str | None
+    encrypted_meta: str
     file_size: int
-    mode: str
     status: str
-    nonce: str
     total_chunks: int
-    uploaded_chunks: int
     created_at: datetime
-    expires_at: datetime | None
-    download_count: int
-    max_downloads: int
 
 
 class ChunkUploadResponse(BaseModel):
@@ -71,37 +62,48 @@ class ChunkUploadResponse(BaseModel):
 
 
 # Helper functions
-async def verify_room_membership(
-    db: AsyncSession, room_id: str, user_id: str
-) -> tuple[Room, RoomMember]:
-    """Verify user is a member of the room."""
-    result = await db.execute(
-        select(Room)
-        .where(Room.id == room_id, Room.is_active == True)
-        .options(selectinload(Room.members))
+def transfer_response(transfer: FileTransfer, sender_name: str) -> TransferResponse:
+    """Build a transfer response."""
+    return TransferResponse(
+        id=transfer.id,
+        room_id=transfer.room_id,
+        sender_id=transfer.sender_id,
+        sender_name=sender_name,
+        encrypted_meta=transfer.encrypted_meta,
+        file_size=transfer.file_size,
+        status=transfer.status.value,
+        total_chunks=transfer.total_chunks,
+        created_at=transfer.created_at,
     )
-    room = result.scalar_one_or_none()
 
-    if not room:
+
+async def get_transfer_or_404(db: AsyncSession, transfer_id: str) -> FileTransfer:
+    """Load a transfer by ID."""
+    result = await db.execute(
+        select(FileTransfer).where(FileTransfer.id == transfer_id)
+    )
+    transfer = result.scalar_one_or_none()
+
+    if not transfer:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Room not found",
+            detail="Transfer not found",
         )
 
-    if room.is_expired:
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="Room has expired",
-        )
+    return transfer
 
-    member = next((m for m in room.members if m.user_id == user_id), None)
-    if not member:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not a member of this room",
-        )
 
-    return room, member
+async def read_body_capped(request: Request, limit: int) -> bytes:
+    """Read the request body, refusing anything larger than limit bytes."""
+    body = bytearray()
+    async for part in request.stream():
+        body += part
+        if len(body) > limit:
+            raise HTTPException(
+                status_code=413,
+                detail="Chunk too large",
+            )
+    return bytes(body)
 
 
 # Routes
@@ -112,107 +114,51 @@ async def init_transfer(
     db: AsyncSession = Depends(get_db),
 ):
     """Initialize a new file transfer."""
-    room, _ = await verify_room_membership(db, request.room_id, current_user.id)
+    await verify_room_membership(db, request.room_id, current_user.id)
 
-    # Check if relay is allowed for this room
-    mode = TransferMode(request.mode)
-    if mode == TransferMode.RELAY and not room.allow_relay:
+    # Refuse new uploads once the disk budget is spent
+    result = await db.execute(select(func.coalesce(func.sum(FileTransfer.file_size), 0)))
+    if result.scalar_one() + request.file_size > settings.max_storage_gb * 1024**3:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Relay transfers not allowed in this room",
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+            detail="Server storage is full",
         )
 
-    # Calculate number of chunks
-    total_chunks = (request.file_size + settings.chunk_size - 1) // settings.chunk_size
-
-    # Calculate expiration
-    expires_at = None
-    if request.expires_in_hours:
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=request.expires_in_hours)
-
-    # Generate transfer ID upfront so we can use it for storage path
-    transfer_id = generate_transfer_id()
-    
-    # Create storage directory for relay mode
-    storage_path = None
-    if mode == TransferMode.RELAY:
-        transfer_dir = settings.upload_dir / transfer_id
-        transfer_dir.mkdir(parents=True, exist_ok=True)
-        storage_path = str(transfer_dir)
-
-    # Create transfer record
     transfer = FileTransfer(
-        id=transfer_id,
+        id=generate_transfer_id(),
         room_id=request.room_id,
         sender_id=current_user.id,
-        encrypted_filename=request.encrypted_filename,
-        encrypted_mimetype=request.encrypted_mimetype,
+        encrypted_meta=request.encrypted_meta,
         file_size=request.file_size,
-        mode=mode,
-        status=TransferStatus.PENDING,
-        nonce=request.nonce,
-        total_chunks=total_chunks,
-        expires_at=expires_at,
-        max_downloads=request.max_downloads,
-        storage_path=storage_path,
+        status=TransferStatus.UPLOADING,
+        total_chunks=(request.file_size + settings.chunk_size - 1) // settings.chunk_size,
     )
 
     db.add(transfer)
     await db.flush()
 
-    return TransferResponse(
-        id=transfer.id,
-        room_id=transfer.room_id,
-        sender_id=transfer.sender_id,
-        sender_name=current_user.display_name,
-        encrypted_filename=transfer.encrypted_filename,
-        encrypted_mimetype=transfer.encrypted_mimetype,
-        file_size=transfer.file_size,
-        mode=transfer.mode.value,
-        status=transfer.status.value,
-        nonce=transfer.nonce,
-        total_chunks=transfer.total_chunks,
-        uploaded_chunks=transfer.uploaded_chunks,
-        created_at=transfer.created_at,
-        expires_at=transfer.expires_at,
-        download_count=transfer.download_count,
-        max_downloads=transfer.max_downloads,
-    )
+    return transfer_response(transfer, current_user.display_name)
 
 
 @router.post("/{transfer_id}/chunks/{chunk_index}", response_model=ChunkUploadResponse)
 async def upload_chunk(
     transfer_id: str,
     chunk_index: int,
-    chunk: UploadFile = File(...),
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Upload an encrypted file chunk."""
-    # Get transfer
-    result = await db.execute(
-        select(FileTransfer).where(FileTransfer.id == transfer_id)
-    )
-    transfer = result.scalar_one_or_none()
+    """Upload an encrypted file chunk as the raw request body.
 
-    if not transfer:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Transfer not found",
-        )
+    Safe to retry: re-sending a chunk overwrites it and is not counted twice.
+    """
+    transfer = await get_transfer_or_404(db, transfer_id)
 
     # Verify sender
     if transfer.sender_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the sender can upload chunks",
-        )
-
-    # Verify transfer state
-    if transfer.status not in [TransferStatus.PENDING, TransferStatus.UPLOADING]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot upload to transfer in state: {transfer.status.value}",
         )
 
     # Verify chunk index
@@ -222,44 +168,43 @@ async def upload_chunk(
             detail=f"Invalid chunk index: {chunk_index}",
         )
 
-    # Verify relay mode
-    if transfer.mode != TransferMode.RELAY:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Chunk upload only supported for relay transfers",
+    became_ready = False
+    uploaded_chunks = transfer.total_chunks
+
+    if transfer.status == TransferStatus.UPLOADING:
+        content = await read_body_capped(request, MAX_SEALED_CHUNK_SIZE)
+        if not content:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Empty chunk",
+            )
+
+        # Write to a temp name first so a half-written chunk is never counted
+        transfer.storage_dir.mkdir(parents=True, exist_ok=True)
+        chunk_path = transfer.chunk_path(chunk_index)
+        temp_path = chunk_path.with_suffix(".tmp")
+        async with aiofiles.open(temp_path, "wb") as f:
+            await f.write(content)
+        os.replace(temp_path, chunk_path)
+
+        uploaded_chunks = sum(
+            1 for p in transfer.storage_dir.iterdir() if p.suffix != ".tmp"
         )
+        if uploaded_chunks >= transfer.total_chunks:
+            transfer.status = TransferStatus.READY
+            became_ready = True
 
-    # Write chunk to disk
-    chunk_path = os.path.join(transfer.storage_path, f"chunk_{chunk_index:06d}")
-    async with aiofiles.open(chunk_path, "wb") as f:
-        content = await chunk.read()
-        await f.write(content)
+        # Commit the changes
+        await db.commit()
 
-    # Update transfer status
-    transfer.uploaded_chunks += 1
-    if transfer.status == TransferStatus.PENDING:
-        transfer.status = TransferStatus.UPLOADING
-
-    transfer_ready = False
-    if transfer.uploaded_chunks >= transfer.total_chunks:
-        transfer.status = TransferStatus.READY
-        transfer_ready = True
-
-    # Commit the changes
-    await db.commit()
-
-    # Broadcast transfer update via WebSocket when ready
-    if transfer_ready:
+    # Tell the room once the file is complete
+    if became_ready:
         await ws_manager.broadcast_to_room(
             transfer.room_id,
             {
                 "type": "new_transfer",
                 "transfer_id": transfer.id,
                 "sender_id": current_user.id,
-                "sender_name": current_user.display_name,
-                "encrypted_filename": transfer.encrypted_filename,
-                "file_size": transfer.file_size,
-                "status": transfer.status.value,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -267,68 +212,9 @@ async def upload_chunk(
     return ChunkUploadResponse(
         transfer_id=transfer.id,
         chunk_index=chunk_index,
-        uploaded_chunks=transfer.uploaded_chunks,
+        uploaded_chunks=uploaded_chunks,
         total_chunks=transfer.total_chunks,
         status=transfer.status.value,
-    )
-
-
-@router.get("/{transfer_id}", response_model=TransferResponse)
-async def get_transfer(
-    transfer_id: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get transfer details."""
-    result = await db.execute(
-        select(FileTransfer)
-        .where(FileTransfer.id == transfer_id)
-        .options(
-            selectinload(FileTransfer.room)
-            .selectinload(Room.members)
-            .selectinload(RoomMember.user)
-        )
-    )
-    transfer = result.scalar_one_or_none()
-
-    if not transfer:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Transfer not found",
-        )
-
-    # Verify user is in the room
-    is_member = any(m.user_id == current_user.id for m in transfer.room.members)
-    if not is_member:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not a member of this room",
-        )
-
-    # Get sender name
-    sender = next(
-        (m.user for m in transfer.room.members if m.user_id == transfer.sender_id),
-        None,
-    )
-    sender_name = sender.display_name if sender else "Unknown"
-
-    return TransferResponse(
-        id=transfer.id,
-        room_id=transfer.room_id,
-        sender_id=transfer.sender_id,
-        sender_name=sender_name,
-        encrypted_filename=transfer.encrypted_filename,
-        encrypted_mimetype=transfer.encrypted_mimetype,
-        file_size=transfer.file_size,
-        mode=transfer.mode.value,
-        status=transfer.status.value,
-        nonce=transfer.nonce,
-        total_chunks=transfer.total_chunks,
-        uploaded_chunks=transfer.uploaded_chunks,
-        created_at=transfer.created_at,
-        expires_at=transfer.expires_at,
-        download_count=transfer.download_count,
-        max_downloads=transfer.max_downloads,
     )
 
 
@@ -338,80 +224,33 @@ async def download_file(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Download an encrypted file.
-    
-    Returns the complete file content in memory (suitable for files up to 1GB).
-    """
-    result = await db.execute(
-        select(FileTransfer)
-        .where(FileTransfer.id == transfer_id)
-        .options(selectinload(FileTransfer.room).selectinload(Room.members))
-    )
-    transfer = result.scalar_one_or_none()
+    """Stream an encrypted file as its stored chunks, in order."""
+    transfer = await get_transfer_or_404(db, transfer_id)
+    await verify_room_membership(db, transfer.room_id, current_user.id)
 
-    if not transfer:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Transfer not found",
-        )
-
-    # Verify user is in the room
-    is_member = any(m.user_id == current_user.id for m in transfer.room.members)
-    if not is_member:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not a member of this room",
-        )
-
-    # Check if downloadable
-    if not transfer.can_download:
-        if transfer.is_expired:
-            raise HTTPException(
-                status_code=status.HTTP_410_GONE,
-                detail="Transfer has expired",
-            )
-        if transfer.download_count >= transfer.max_downloads:
-            raise HTTPException(
-                status_code=status.HTTP_410_GONE,
-                detail="Maximum downloads reached",
-            )
+    if transfer.status != TransferStatus.READY:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Transfer not ready: {transfer.status.value}",
         )
 
-    # Get values we need
-    storage_path = transfer.storage_path
-    total_chunks = transfer.total_chunks
-    file_size = transfer.file_size
-    nonce = transfer.nonce
+    paths = [transfer.chunk_path(i) for i in range(transfer.total_chunks)]
+    try:
+        total_size = sum(p.stat().st_size for p in paths)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="File is no longer available",
+        )
 
-    # Update download count
-    transfer.download_count += 1
-    if transfer.download_count >= transfer.max_downloads:
-        transfer.status = TransferStatus.COMPLETED
-        transfer.completed_at = datetime.now(timezone.utc)
-    
-    # Commit download count update
-    await db.commit()
-    
-    # Read all chunks into memory
-    chunks = []
-    for i in range(total_chunks):
-        chunk_path = os.path.join(storage_path, f"chunk_{i:06d}")
-        async with aiofiles.open(chunk_path, "rb") as f:
-            chunks.append(await f.read())
-    
-    # Combine all chunks
-    file_data = b"".join(chunks)
+    def iter_chunks():
+        for path in paths:
+            yield path.read_bytes()
 
-    return Response(
-        content=file_data,
+    return StreamingResponse(
+        iter_chunks(),
         media_type="application/octet-stream",
-        headers={
-            "Content-Length": str(len(file_data)),
-            "X-Transfer-Nonce": nonce,
-        },
+        headers={"Content-Length": str(total_size)},
     )
 
 
@@ -421,46 +260,26 @@ async def list_room_transfers(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all transfers in a room."""
-    room, _ = await verify_room_membership(db, room_id, current_user.id)
+    """List completed transfers in a room, oldest first.
+
+    ponytail: returns every transfer with its thumbnail in one response.
+    Paginate if rooms grow to many hundreds of images.
+    """
+    room = await verify_room_membership(db, room_id, current_user.id)
+    names = {m.user_id: m.user.display_name for m in room.members}
 
     result = await db.execute(
         select(FileTransfer)
-        .where(FileTransfer.room_id == room_id)
-        .order_by(FileTransfer.created_at.desc())
+        .where(
+            FileTransfer.room_id == room_id,
+            FileTransfer.status == TransferStatus.READY,
+        )
+        .order_by(FileTransfer.created_at)
     )
-    transfers = result.scalars().all()
-
-    # Get member info for sender names
-    members_result = await db.execute(
-        select(RoomMember)
-        .where(RoomMember.room_id == room_id)
-        .options(selectinload(RoomMember.user))
-    )
-    members = {m.user_id: m.user for m in members_result.scalars().all()}
 
     return [
-        TransferResponse(
-            id=t.id,
-            room_id=t.room_id,
-            sender_id=t.sender_id,
-            sender_name=members.get(t.sender_id, {}).display_name
-            if members.get(t.sender_id)
-            else "Unknown",
-            encrypted_filename=t.encrypted_filename,
-            encrypted_mimetype=t.encrypted_mimetype,
-            file_size=t.file_size,
-            mode=t.mode.value,
-            status=t.status.value,
-            nonce=t.nonce,
-            total_chunks=t.total_chunks,
-            uploaded_chunks=t.uploaded_chunks,
-            created_at=t.created_at,
-            expires_at=t.expires_at,
-            download_count=t.download_count,
-            max_downloads=t.max_downloads,
-        )
-        for t in transfers
+        transfer_response(t, names.get(t.sender_id, "Unknown"))
+        for t in result.scalars().all()
     ]
 
 
@@ -470,17 +289,8 @@ async def cancel_transfer(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Cancel a transfer (sender only)."""
-    result = await db.execute(
-        select(FileTransfer).where(FileTransfer.id == transfer_id)
-    )
-    transfer = result.scalar_one_or_none()
-
-    if not transfer:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Transfer not found",
-        )
+    """Cancel a transfer and delete its data (sender only)."""
+    transfer = await get_transfer_or_404(db, transfer_id)
 
     if transfer.sender_id != current_user.id:
         raise HTTPException(
@@ -488,14 +298,5 @@ async def cancel_transfer(
             detail="Only the sender can cancel a transfer",
         )
 
-    # Mark as cancelled
-    transfer.status = TransferStatus.CANCELLED
-
-    # Clean up storage if relay mode
-    if transfer.mode == TransferMode.RELAY and transfer.storage_path:
-        import shutil
-
-        if os.path.exists(transfer.storage_path):
-            shutil.rmtree(transfer.storage_path)
-
+    await delete_transfer(db, transfer)
     return {"message": "Transfer cancelled"}

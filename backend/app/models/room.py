@@ -2,11 +2,10 @@
 
 import secrets
 from datetime import datetime, timezone
-from sqlalchemy import String, Boolean, DateTime, ForeignKey, Text, Enum
+from sqlalchemy import String, Boolean, ForeignKey, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-import enum
 
-from app.database import Base
+from app.database import Base, UTCDateTime
 
 
 def utc_now() -> datetime:
@@ -26,15 +25,8 @@ def generate_room_code() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(6))
 
 
-class RoomType(enum.Enum):
-    """Type of transfer room."""
-
-    DIRECT = "direct"  # One-to-one transfer
-    GROUP = "group"  # Multiple participants
-
-
 class Room(Base):
-    """Transfer room model."""
+    """Transfer room model. A room holds at most two members."""
 
     __tablename__ = "rooms"
 
@@ -45,16 +37,12 @@ class Room(Base):
         String(10), unique=True, index=True, default=generate_room_code
     )
     name: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    room_type: Mapped[RoomType] = mapped_column(
-        Enum(RoomType), default=RoomType.DIRECT
-    )
     created_by: Mapped[str] = mapped_column(
         String(32), ForeignKey("users.id"), nullable=False
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    allow_relay: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 
     # Relationships
     members: Mapped[list["RoomMember"]] = relationship(
@@ -99,9 +87,9 @@ class RoomMember(Base):
     )
     # Public key for E2E encryption (base64 encoded X25519 public key)
     public_key: Mapped[str] = mapped_column(Text, nullable=False)
-    joined_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    joined_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
     is_online: Mapped[bool] = mapped_column(Boolean, default=False)
-    last_seen: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_seen: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
 
     # Relationships
     room: Mapped["Room"] = relationship("Room", back_populates="members")

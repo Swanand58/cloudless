@@ -1,35 +1,21 @@
 "use client";
 
 import { useState } from "react";
-import { useRoomStore } from "@/store/room";
-import { useAuthStore } from "@/store/auth";
+import { useRoomStore, getPeer } from "@/store/room";
 import { SafetyNumber } from "@/components/SafetyNumber";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, ShieldCheck } from "lucide-react";
 import { VisuallyHidden } from "@radix-ui/react-visually-hidden";
 
 export function VerifyIdentity() {
-  const { currentRoom, keyPair } = useRoomStore();
-  const { user } = useAuthStore();
+  const { currentRoom, keyPair, myUserId, peerVerified, markPeerVerified } = useRoomStore();
   const [showSafetyNumber, setShowSafetyNumber] = useState(false);
-  const [selectedPeer, setSelectedPeer] = useState<{
-    userId: string;
-    name: string;
-    publicKey: string;
-  } | null>(null);
 
-  // Filter out the current user by user_id (more reliable than public_key)
-  const otherMembers =
-    currentRoom?.members.filter((m) => m.user_id !== user?.id) || [];
+  const peer = getPeer(currentRoom, myUserId);
 
-  if (otherMembers.length === 0) return null;
-
-  const handleVerifyPeer = (member: { user_id: string; display_name: string; public_key: string }) => {
-    setSelectedPeer({ userId: member.user_id, name: member.display_name, publicKey: member.public_key });
-    setShowSafetyNumber(true);
-  };
+  if (!peer || !keyPair) return null;
 
   return (
     <>
@@ -41,17 +27,21 @@ export function VerifyIdentity() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-1">
-          {otherMembers.map((member) => (
-            <Button
-              key={member.user_id}
-              variant="ghost"
-              className="w-full justify-between"
-              onClick={() => handleVerifyPeer(member)}
-            >
-              <span className="text-sm">{member.display_name}</span>
+          <Button
+            variant="ghost"
+            className="w-full justify-between"
+            onClick={() => setShowSafetyNumber(true)}
+          >
+            <span className="text-sm">{peer.display_name}</span>
+            {peerVerified ? (
+              <span className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                <ShieldCheck className="h-4 w-4" />
+                Verified
+              </span>
+            ) : (
               <ChevronRight className="h-4 w-4 text-muted-foreground" />
-            </Button>
-          ))}
+            )}
+          </Button>
         </CardContent>
       </Card>
 
@@ -59,16 +49,18 @@ export function VerifyIdentity() {
       <Dialog open={showSafetyNumber} onOpenChange={setShowSafetyNumber}>
         <DialogContent className="sm:max-w-md p-0 gap-0 overflow-hidden">
           <VisuallyHidden>
-            <DialogTitle>Verify {selectedPeer?.name}</DialogTitle>
+            <DialogTitle>Verify {peer.display_name}</DialogTitle>
           </VisuallyHidden>
-          {selectedPeer && keyPair && (
-            <SafetyNumber
-              myPublicKey={keyPair.publicKey}
-              peerPublicKey={selectedPeer.publicKey}
-              peerName={selectedPeer.name}
-              onVerified={() => setShowSafetyNumber(false)}
-            />
-          )}
+          <SafetyNumber
+            myPublicKey={keyPair.publicKey}
+            peerPublicKey={peer.public_key}
+            peerName={peer.display_name}
+            verified={peerVerified}
+            onVerified={() => {
+              markPeerVerified();
+              setShowSafetyNumber(false);
+            }}
+          />
         </DialogContent>
       </Dialog>
     </>

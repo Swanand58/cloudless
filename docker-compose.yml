@@ -1,37 +1,57 @@
+# Production stack. Configure it in .env (see .env.example), then:
+#   docker compose up -d --build                    # reachable on this machine only
+#   docker compose --profile tunnel up -d --build   # also published on your domain
 services:
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    ports:
-      - "8000:8000"
     environment:
-      - DEBUG=true
-      - SECRET_KEY=change-this-to-a-secure-random-string-in-production
-      - DATABASE_URL=sqlite+aiosqlite:///./data/cloudless.db
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env (openssl rand -hex 32)}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/cloudless.db
       - UPLOAD_DIR=/app/data/uploads
-      - CORS_ORIGINS=["http://localhost:3000","http://127.0.0.1:3000"]
     volumes:
-      - cloudless_data:/app/data
+      - data:/app/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 10s
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-      args:
-        - NEXT_PUBLIC_API_URL=http://localhost:8000
+    restart: unless-stopped
+
+  # Single entry point: /api goes to the backend, everything else to the frontend
+  proxy:
+    image: caddy:2-alpine
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
     ports:
-      - "3000:3000"
+      - "127.0.0.1:${PORT:-8080}:80"
     depends_on:
       backend:
         condition: service_healthy
+      frontend:
+        condition: service_started
+    restart: unless-stopped
+
+  # Publishes the proxy on your domain through a Cloudflare named tunnel
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run ${TUNNEL_ID:-}
+    volumes:
+      - ./deploy/cloudflared.yml:/etc/cloudflared/config.yml:ro
+      - ${HOME}/.cloudflared/${TUNNEL_ID:-missing}.json:/etc/cloudflared/credentials.json:ro
+    depends_on:
+      - proxy
     restart: unless-stopped
 
 volumes:
-  cloudless_data:
+  data:

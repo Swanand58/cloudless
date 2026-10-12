@@ -12,20 +12,21 @@ interface SafetyNumberProps {
   myPublicKey: string;
   peerPublicKey: string;
   peerName: string;
-  onVerified?: () => void;
+  verified: boolean;
+  onVerified: () => void;
 }
 
 export function SafetyNumber({
   myPublicKey,
   peerPublicKey,
   peerName,
+  verified,
   onVerified,
 }: SafetyNumberProps) {
   const [safetyNumber, setSafetyNumber] = useState<string>("");
   const [myEmoji, setMyEmoji] = useState<string[]>([]);
   const [peerEmoji, setPeerEmoji] = useState<string[]>([]);
   const [showNumber, setShowNumber] = useState(false);
-  const [isVerified, setIsVerified] = useState(false);
 
   useEffect(() => {
     const generate = async () => {
@@ -37,17 +38,12 @@ export function SafetyNumber({
     generate();
   }, [myPublicKey, peerPublicKey]);
 
-  const handleVerify = () => {
-    setIsVerified(true);
-    onVerified?.();
-  };
-
   return (
     <Card>
       <CardHeader>
         <div className="flex items-center justify-between">
           <CardTitle>Verify {peerName}</CardTitle>
-          {isVerified && (
+          {verified && (
             <Badge variant="default" className="bg-green-600 gap-1">
               <ShieldCheck className="h-3 w-3" />
               Verified
@@ -108,8 +104,8 @@ export function SafetyNumber({
         </Alert>
 
         {/* Verify button */}
-        {!isVerified && (
-          <Button className="w-full bg-green-600 hover:bg-green-700" onClick={handleVerify}>
+        {!verified && (
+          <Button className="w-full bg-green-600 hover:bg-green-700" onClick={onVerified}>
             Mark as Verified
           </Button>
         )}

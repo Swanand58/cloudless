@@ -1,351 +1,167 @@
-# Cloudless - Secure Self-Hosted File Transfer
+# Cloudless - Private Photo and File Sharing
 
-A completely secure, self-hosted file transfer application with end-to-end encryption. Your files stay on your hardware, encrypted with keys that only you and your recipient can access.
+A self-hosted, end-to-end encrypted place for two people to send each other photos, files and messages. Everything is encrypted in the browser before it leaves your device; the server on your own hardware only stores ciphertext.
 
 ## Features
 
-- **End-to-End Encryption**: Files are encrypted on your device using XSalsa20-Poly1305 before leaving your browser
-- **Zero Knowledge**: The server never sees your encryption keys, file contents, or even filenames
-- **Encrypted Chat**: WhatsApp-style chat interface with inline file attachments
-- **Relay Transfers**: Encrypted relay through the server for reliable file transfer
-- **Safety Numbers**: Verify you're talking to the right person with safety number comparison
-- **Invite-Only**: Control who can register with admin-managed invite codes
-- **Role-Based Access**: Admin users can manage invites and system settings
-- **Dark/Light Theme**: System-aware theming with manual toggle option
-- **Self-Hosted**: Runs on your own hardware, under your complete control
+- **End-to-End Encryption**: Files and messages are encrypted in the browser with XSalsa20-Poly1305
+- **Built for Photos**: Images up to 50 MB with instant previews and a full-size viewer
+- **Lasting Rooms**: Send while the other person is offline; rooms and their contents delete themselves after 7 days
+- **Encrypted Chat**: Chat with inline file attachments
+- **Safety Numbers**: Verify you're talking to the right person, with a warning if their key ever changes
+- **Invite-Only**: Only people you invite can register
+- **Self-Hosted**: One `docker compose up` on your own machine, published through your own domain
 
-## Security Architecture
+## How it works
 
-### Encryption Layers
-
-1. **Network Layer**: Tailscale WireGuard (ChaCha20-Poly1305)
-2. **Transport Layer**: HTTPS/WSS with TLS 1.3
-3. **Application Layer**: E2E encryption (XSalsa20-Poly1305)
-4. **Storage Layer**: Encrypted at rest with unique keys per file
-
-### Key Exchange
-
-- X25519 Elliptic Curve Diffie-Hellman for key agreement
-- Ephemeral keys per session (Perfect Forward Secrecy)
-- Safety numbers for MITM protection
-
-### Password Security
-
-- Argon2id hashing (memory-hard, resistant to GPU attacks)
-- Secure session management with JWT
-
-## Prerequisites
-
-- Docker and Docker Compose (recommended)
-- OR Python 3.11+ with [uv](https://docs.astral.sh/uv/) and Node.js 18+
-- [Tailscale](https://tailscale.com/) (free for personal use, recommended for secure access)
-
-## Quick Start with Docker
-
-### 1. Clone and Setup
-
-```bash
-git clone <your-repo>
-cd cloudless
+```
+ Friend's browser ──HTTPS──► Cloudflare ──tunnel──► your machine
+                                                    ┌──────────────────────────────┐
+                                                    │ proxy (Caddy)                │
+                                                    │   /api/*  ──► backend :8000  │
+                                                    │   else    ──► frontend :3000 │
+                                                    │ backend: FastAPI + SQLite    │
+                                                    │ frontend: Next.js            │
+                                                    └──────────────────────────────┘
 ```
 
-### 2. Configure Environment
+- Each person generates an X25519 key pair per room, kept in their browser. The shared secret derived from the two keys encrypts messages, file contents, file names and thumbnails.
+- A file is split into 512 KB chunks, each encrypted separately. The recipient checks a SHA-256 of the whole file after decrypting, which catches missing or reordered chunks.
+- A room holds exactly two people.
+
+## Setup
+
+You need Docker, and for access from outside your machine: a domain whose DNS is managed by Cloudflare (free plan) and [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
+
+### 1. Configure
 
 ```bash
-# Backend configuration
-cd backend
 cp .env.example .env
-# Edit .env and set a secure SECRET_KEY:
-# SECRET_KEY=$(openssl rand -hex 32)
-
-# Frontend configuration
-cd ../frontend
-cp .env.local.example .env.local
-# Edit .env.local if needed
+# Put the output of this in .env as SECRET_KEY:
+openssl rand -hex 32
 ```
 
-### 3. Start with Docker Compose
+### 2. Start
 
 ```bash
-docker-compose up -d
+docker compose up -d --build
 ```
 
-The application will be available at:
-- Frontend: http://localhost:3000
-- Backend API: http://localhost:8000
+The app is now at http://localhost:8080, on this machine only.
 
-### 4. Initial Admin Setup
-
-When you first start the backend, it creates an admin user. Check the backend logs for the initial credentials:
+On first start the backend creates an `admin` account. If you did not set `ADMIN_PASSWORD` in `.env`, the generated password is printed once:
 
 ```bash
-docker-compose logs backend | grep -i admin
+docker compose logs backend | grep -i "admin"
 ```
 
-**IMPORTANT**: Log in immediately and change your password via Settings.
+Log in, change the password in Settings, and create invite codes there for the people you want to share with.
 
-## Manual Setup (Without Docker)
+### 3. Publish on your domain
 
-### Backend Setup
+Check that Cloudflare manages your domain's DNS. The answer should end in `ns.cloudflare.com`:
 
 ```bash
-cd backend
-
-# Create environment file
-cp .env.example .env
-# Edit .env and set a secure SECRET_KEY
-
-# Install dependencies and run
-uv sync
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+dig NS example.com +short
 ```
 
-### Frontend Setup
+If it does not, add the domain to a free Cloudflare account and switch the nameservers at your registrar first.
+
+Create the tunnel once (the first command opens a browser to log in):
 
 ```bash
-cd frontend
-
-# Create environment file
-cp .env.local.example .env.local
-
-# Install dependencies
-npm install
-
-# Development
-npm run dev
-
-# Or build for production
-npm run build
-npm start
+cloudflared tunnel login
+cloudflared tunnel create cloudless
+cloudflared tunnel route dns cloudless cloudless.example.com
 ```
 
-## Tailscale Setup (Recommended)
-
-Tailscale creates a private encrypted network so your server isn't exposed to the public internet.
-
-### On Your PC (Host)
-
-1. Install Tailscale: https://tailscale.com/download
-2. Sign in and enable MagicDNS
-3. Note your Tailscale IP (e.g., `100.x.y.z`)
-
-### Update Configuration
-
-Update your frontend `.env.local`:
-```
-NEXT_PUBLIC_API_URL=http://100.x.y.z:8000
-```
-
-Update your backend `.env`:
-```
-CORS_ORIGINS=["http://100.x.y.z:3000"]
-```
-
-### For Your Friends
-
-1. Send them your Tailscale invite link (from admin console)
-2. They install Tailscale and join your network
-3. They can now access your Cloudless instance via your Tailscale IP
-
-### HTTPS with Tailscale (Optional)
-
-Tailscale can provide automatic HTTPS certificates:
+`tunnel create` prints a tunnel ID (a UUID). Put it in `.env` as `TUNNEL_ID`, then:
 
 ```bash
-# Enable HTTPS on your machine
-tailscale cert your-machine-name.your-tailnet.ts.net
-
-# Use the certificates with your servers
+docker compose --profile tunnel up -d
 ```
 
-## Usage
+The app is now at `https://cloudless.example.com`.
 
-### Creating a Transfer Room
+On Linux, the tunnel container may not be able to read the credentials file; `chmod 644 ~/.cloudflared/<TUNNEL_ID>.json` fixes that.
 
-1. Log in to Cloudless
-2. Click "Create New Room"
-3. Share the room code with your friend (click to copy)
-4. Wait for them to join - you'll see a notification when they do
+### Keeping it running
 
-### Joining a Room
+The app is only reachable while the host is on and awake. On a Mac: start Docker Desktop at login, and prevent sleep while plugged in (System Settings, Battery, Options). Containers restart on their own.
 
-1. Log in to Cloudless
-2. Enter the room code in "Join Room"
-3. You're now connected with end-to-end encryption
+## Using it
 
-### Verifying Identity (Important!)
+1. **Create a room** and send the six-character code to your friend.
+2. **They join** with the code. From then on either of you can send at any time.
+3. **Verify** (Room Info, Verify Identity): compare the emoji fingerprints over a call or in person, then mark as verified.
+4. **Send** photos or files with the paperclip, several at once if you like. The recipient sees a preview immediately and taps to open the full image.
 
-Before transferring sensitive files:
+Rooms are listed on the home page until they expire.
 
-1. Click "Verify Identity" in the room sidebar
-2. Compare safety numbers with your friend over phone/in-person
-3. If they match, you can be confident there's no man-in-the-middle
+## Security
 
-### Sending Files
+### What the server (and Cloudflare) cannot see
 
-1. Click the attachment icon in the chat input
-2. Select a file (up to 1GB supported)
-3. The file is encrypted in your browser before upload
-4. Progress shows encryption → upload → complete
-5. Your friend sees the file in the chat and can download it
-
-### Encrypted Chat
-
-Messages are end-to-end encrypted just like files. Type in the chat input and press Enter or click Send.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Your Friends (Browsers)                   │
-│                   via Tailscale VPN Network                  │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-          ┌───────────┴───────────┐
-          │   Tailscale Mesh      │
-          │   (WireGuard E2E)     │
-          └───────────┬───────────┘
-                      │
-┌─────────────────────┴───────────────────────────────────────┐
-│                       Your PC                                │
-│  ┌─────────────────┐         ┌─────────────────────────┐    │
-│  │  Next.js :3000  │◄───────►│    FastAPI :8000        │    │
-│  │  - React 19     │         │    - REST API           │    │
-│  │  - shadcn/ui    │         │    - WebSocket          │    │
-│  │  - TweetNaCl    │         │    - File Relay         │    │
-│  │  - Zustand      │         │    - SQLAlchemy         │    │
-│  └─────────────────┘         └───────────┬─────────────┘    │
-│                                          │                   │
-│                              ┌───────────┴─────────────┐    │
-│                              │  SQLite   │  Encrypted  │    │
-│                              │  (users)  │  Uploads    │    │
-│                              └─────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Tech Stack
-
-### Frontend
-- Next.js 16 (App Router)
-- React 19
-- TypeScript
-- TailwindCSS v4
-- shadcn/ui components
-- Zustand (state management)
-- TweetNaCl (client-side encryption)
-
-### Backend
-- FastAPI
-- SQLAlchemy (async)
-- aiosqlite
-- PyNaCl (server-side crypto utilities)
-- Argon2id (password hashing)
-- python-jose (JWT)
-
-## API Endpoints
-
-### Authentication
-- `POST /api/auth/login` - Login
-- `POST /api/auth/register` - Register with invite code
-- `POST /api/auth/refresh` - Refresh tokens
-- `GET /api/auth/me` - Current user info
-- `PUT /api/auth/password` - Change password
-- `POST /api/auth/invites` - Create invite code (admin only)
-- `GET /api/auth/invites` - List invite codes (admin only)
-
-### Rooms
-- `POST /api/rooms` - Create room
-- `POST /api/rooms/join` - Join room by code
-- `GET /api/rooms` - List your rooms
-- `GET /api/rooms/{id}` - Get room details
-- `GET /api/rooms/{id}/safety-number/{peer_id}` - Get safety number
-
-### Transfers
-- `POST /api/transfers` - Initialize transfer
-- `POST /api/transfers/{id}/chunks/{index}` - Upload chunk
-- `GET /api/transfers/{id}` - Get transfer info
-- `GET /api/transfers/{id}/download` - Download file
-- `GET /api/transfers/room/{room_id}` - List room transfers
-
-### WebSocket
-- `WS /api/ws/{room_id}?token=...` - Real-time room connection
-
-## Security Considerations
-
-### What the Server CAN See
-- Encrypted file blobs (cannot decrypt)
-- File sizes
-- User accounts and room metadata
-- When transfers happen (not what's transferred)
-
-### What the Server CANNOT See
-- File contents
-- Filenames (encrypted)
-- Message contents (encrypted)
+- File contents, file names, types and thumbnails
+- Message contents
 - Encryption keys
 
-### Recommendations
+### What they can see
 
-1. **Use Tailscale**: Keeps your server off the public internet
-2. **Verify Safety Numbers**: Always verify before sensitive transfers
-3. **Secure Your Host**: Keep your PC secure - it's running your server
-4. **Regular Updates**: Keep dependencies updated
-5. **Strong Passwords**: Use strong, unique passwords
-6. **Change Default Credentials**: Change the admin password immediately after first login
+- Encrypted blobs and their sizes
+- Accounts, room membership and timing
+- **Cloudflare ends the HTTPS connection**, so it can also see login passwords and session tokens in transit, and it delivers the app's JavaScript to your friends. This is true of any browser app behind a proxy. Use a password you use nowhere else.
+
+### Limits to know about
+
+- **One browser per person per room.** Keys live in the browser. Clearing site data or opening the room on another device creates a new key: the other person sees a key-change warning, and older content can no longer be opened.
+- **Verification is manual.** Until you compare safety numbers, the server could have swapped keys.
+- Sessions are stored in the browser's local storage. Changing your password signs out every other session.
+
+## Configuration
+
+Deployment settings are in the root `.env` (see `.env.example`). Backend limits can be overridden by adding them to the backend's `environment` in `docker-compose.yml`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAX_FILE_SIZE_MB` | 50 | Largest file. Also change `MAX_FILE_SIZE` in `frontend/src/lib/filecrypt.ts`. |
+| `MAX_STORAGE_GB` | 20 | Total for all rooms; uploads are refused beyond it |
+| `ROOM_EXPIRY_DAYS` | 7 | Lifetime of a room and everything in it |
+| `AUTH_RATE_LIMIT_REQUESTS` | 10 | Login and register attempts per minute per IP |
+
+Data lives in the `data` Docker volume (SQLite database and encrypted uploads).
 
 ## Development
 
-### Backend Tests
-
 ```bash
+# Backend, http://localhost:8000
 cd backend
-uv run pytest
+cp .env.example .env
+uv sync
+uv run uvicorn app.main:app --reload
+
+# Frontend, http://localhost:3000
+cd frontend
+cp .env.local.example .env.local
+npm install
+npm run dev
 ```
 
-### Frontend Development
+Tests:
 
 ```bash
-cd frontend
-npm run dev    # Development with hot reload
-npm run lint   # Run linter
-npm run build  # Production build
+cd backend && uv run pytest
+cd frontend && npm test && npm run lint
 ```
 
-## Troubleshooting
+There are no database migrations yet. After changing a model, delete the local `cloudless.db` (or the `data` volume).
 
-### "WebSocket connection failed"
-- Check that the backend is running
-- Verify CORS_ORIGINS includes your frontend URL
-- Check browser console for detailed errors
+## Tech stack
 
-### "Decryption failed"
-- Ensure both parties are in the same room
-- Try leaving and rejoining the room
-- Verify safety numbers match
-- Make sure the shared secret was established (wait for "Connected" status)
-
-### "Cannot connect to server"
-- If using Tailscale, ensure both devices are connected
-- Check firewall allows connections to ports 3000 and 8000
-- Verify the NEXT_PUBLIC_API_URL is correct
-
-### "Rate limit exceeded"
-- Wait a few seconds and try again
-- This protects against abuse
+- **Frontend**: Next.js 16, React 19, TypeScript, Tailwind CSS v4, shadcn/ui, Zustand, TweetNaCl
+- **Backend**: FastAPI, SQLAlchemy (async) with SQLite, Argon2id password hashing, JWT sessions
+- **Deployment**: Docker Compose, Caddy, Cloudflare Tunnel
 
 ## License
 
-MIT License - Use freely, but remember: with great power comes great responsibility.
-
-## Contributing
-
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Submit a pull request
-
-Focus areas:
-- Security improvements
-- Performance optimizations
-- UI/UX enhancements
-- Documentation
+MIT

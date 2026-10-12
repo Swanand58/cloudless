@@ -1,21 +1,29 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { useRoomStore } from "@/store/room";
-import { useAuthStore } from "@/store/auth";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Copy, Check } from "lucide-react";
+import { Copy, Check, LogOut } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
 interface PeerStatusProps {
   className?: string;
 }
 
+function daysLeft(expiresAt: string | null): string | null {
+  if (!expiresAt) return null;
+  const days = Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 86_400_000);
+  if (days <= 0) return "Expires today";
+  return `Expires in ${days} day${days === 1 ? "" : "s"}`;
+}
+
 export function PeerStatus({ className = "" }: PeerStatusProps) {
-  const { currentRoom, onlineUsers } = useRoomStore();
-  const { user } = useAuthStore();
+  const router = useRouter();
+  const { currentRoom, onlineUsers, myUserId, leaveRoom } = useRoomStore();
   const [copied, setCopied] = useState(false);
 
   if (!currentRoom) return null;
@@ -26,19 +34,27 @@ export function PeerStatus({ className = "" }: PeerStatusProps) {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  // Sort members: current user first, then online users, then offline
-  const sortedMembers = [...currentRoom.members].sort((a, b) => {
-    const aIsMe = a.user_id === user?.id;
-    const bIsMe = b.user_id === user?.id;
-    if (aIsMe) return -1;
-    if (bIsMe) return 1;
-    
-    const aOnline = onlineUsers.has(a.user_id);
-    const bOnline = onlineUsers.has(b.user_id);
-    if (aOnline && !bOnline) return -1;
-    if (!aOnline && bOnline) return 1;
-    return 0;
-  });
+  const handleLeave = async () => {
+    if (
+      !window.confirm(
+        "Leave this room for good? You will lose access to its messages and files on this device."
+      )
+    ) {
+      return;
+    }
+    try {
+      await leaveRoom();
+      router.push("/");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not leave the room");
+    }
+  };
+
+  // Current user first
+  const sortedMembers = [...currentRoom.members].sort(
+    (a, b) => Number(b.user_id === myUserId) - Number(a.user_id === myUserId)
+  );
+  const expiry = daysLeft(currentRoom.expires_at);
 
   return (
     <Card className={className}>
@@ -47,9 +63,9 @@ export function PeerStatus({ className = "" }: PeerStatusProps) {
       </CardHeader>
       <CardContent className="space-y-2">
         {sortedMembers.map((member) => {
-          const isOnline = onlineUsers.has(member.user_id);
-          const isMe = member.user_id === user?.id;
-          
+          const isMe = member.user_id === myUserId;
+          const isOnline = isMe || onlineUsers.has(member.user_id);
+
           return (
             <div key={member.user_id} className="flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -67,14 +83,14 @@ export function PeerStatus({ className = "" }: PeerStatusProps) {
                   {isMe && <span className="text-muted-foreground ml-1">(you)</span>}
                 </span>
               </div>
-              <Badge 
-                variant={isOnline ? "default" : "secondary"} 
+              <Badge
+                variant={isOnline ? "default" : "secondary"}
                 className={cn(
                   "text-xs",
                   !isOnline && "text-muted-foreground"
                 )}
               >
-                {isOnline ? "Online" : "Left"}
+                {isOnline ? "Online" : "Offline"}
               </Badge>
             </div>
           );
@@ -108,6 +124,19 @@ export function PeerStatus({ className = "" }: PeerStatusProps) {
             </div>
           </div>
         )}
+
+        <div className="pt-2 flex items-center justify-between gap-2">
+          <span className="text-xs text-muted-foreground">{expiry}</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 text-destructive hover:text-destructive"
+            onClick={handleLeave}
+          >
+            <LogOut className="h-4 w-4 mr-1" />
+            Leave room
+          </Button>
+        </div>
       </CardContent>
     </Card>
   );

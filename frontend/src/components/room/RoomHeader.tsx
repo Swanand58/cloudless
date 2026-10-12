@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useAuthStore } from "@/store/auth";
 import { useRoomStore } from "@/store/room";
-import { Lock, Copy, LogOut, Check } from "lucide-react";
+import { Lock, Copy, ArrowLeft, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
@@ -45,13 +45,13 @@ export function RoomHeader() {
           </div>
         </div>
 
-        {/* Right: user + leave + theme toggle */}
+        {/* Right: user + back to room list + theme toggle */}
         <div className="flex items-center gap-1.5 sm:gap-3">
           <span className="text-sm text-muted-foreground hidden md:inline">{user?.display_name}</span>
-          <Button variant="ghost" size="sm" className="text-destructive hover:text-destructive h-8 px-2 sm:px-3" asChild>
+          <Button variant="ghost" size="sm" className="h-8 px-2 sm:px-3" asChild>
             <Link href="/">
-              <LogOut className="h-4 w-4 sm:mr-1" />
-              <span className="hidden sm:inline">Leave</span>
+              <ArrowLeft className="h-4 w-4 sm:mr-1" />
+              <span className="hidden sm:inline">Rooms</span>
             </Link>
           </Button>
           <div className="hidden sm:flex items-center gap-3">

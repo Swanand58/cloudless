@@ -88,21 +88,12 @@ async def get_current_user(
     db: AsyncSession = Depends(get_db),
 ) -> User:
     """Dependency to get the current authenticated user."""
-    token = credentials.credentials
-    user_id = auth_service.verify_token(token, "access")
+    user = await auth_service.get_user_from_token(db, credentials.credentials, "access")
 
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    user = await auth_service.get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
+            detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -166,19 +157,12 @@ async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db))
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_token(request: RefreshRequest, db: AsyncSession = Depends(get_db)):
     """Refresh access token using refresh token."""
-    user_id = auth_service.verify_token(request.refresh_token, "refresh")
+    user = await auth_service.get_user_from_token(db, request.refresh_token, "refresh")
 
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired refresh token",
-        )
-
-    user = await auth_service.get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
+            detail="Invalid or expired refresh token",
         )
 
     return TokenResponse(
@@ -199,13 +183,16 @@ async def get_me(current_user: User = Depends(get_current_user)):
     )
 
 
-@router.post("/change-password")
+@router.post("/change-password", response_model=TokenResponse)
 async def change_password(
     request: ChangePasswordRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Change the current user's password."""
+    """Change the current user's password.
+
+    Signs out every other session; the caller gets fresh tokens.
+    """
     from app.services.crypto import crypto_service
 
     # Verify current password
@@ -224,9 +211,13 @@ async def change_password(
 
     # Update password
     current_user.password_hash = crypto_service.hash_password(request.new_password)
+    current_user.password_changed_at = datetime.now(timezone.utc)
     await db.commit()
 
-    return {"message": "Password changed successfully"}
+    return TokenResponse(
+        access_token=auth_service.create_access_token(current_user.id),
+        refresh_token=auth_service.create_refresh_token(current_user.id),
+    )
 
 
 @router.post("/invites", response_model=InviteResponse)
