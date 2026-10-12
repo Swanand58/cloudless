@@ -2,7 +2,9 @@
  * API client for backend communication.
  */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Empty in production: the API is served from the same origin under /api.
+// Set NEXT_PUBLIC_API_URL only for local development against a separate backend.
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 interface TokenResponse {
   access_token: string;
@@ -31,11 +33,29 @@ interface RoomResponse {
   id: string;
   code: string;
   name: string | null;
-  room_type: string;
-  allow_relay: boolean;
   created_at: string;
   expires_at: string | null;
   members: RoomMember[];
+}
+
+interface RoomListItem {
+  id: string;
+  code: string;
+  name: string | null;
+  member_count: number;
+  peer_name: string | null;
+  created_at: string;
+  expires_at: string | null;
+}
+
+/** Stored chat message, same shape as the WebSocket chat event. */
+interface MessageResponse {
+  message_id: string;
+  sender_id: string;
+  sender_name: string;
+  encrypted_content: string;
+  nonce: string;
+  timestamp: string;
 }
 
 interface TransferResponse {
@@ -43,18 +63,11 @@ interface TransferResponse {
   room_id: string;
   sender_id: string;
   sender_name: string;
-  encrypted_filename: string;
-  encrypted_mimetype: string | null;
+  encrypted_meta: string;
   file_size: number;
-  mode: string;
   status: string;
-  nonce: string;
   total_chunks: number;
-  uploaded_chunks: number;
   created_at: string;
-  expires_at: string | null;
-  download_count: number;
-  max_downloads: number;
 }
 
 class ApiError extends Error {
@@ -253,15 +266,17 @@ class ApiClient {
     this.clearTokens();
   }
 
-  // Password change
-  async changePassword(currentPassword: string, newPassword: string): Promise<{ message: string }> {
-    return this.request("/api/auth/change-password", {
+  // Password change. The server signs out every older session, so the
+  // fresh tokens it returns replace ours.
+  async changePassword(currentPassword: string, newPassword: string): Promise<void> {
+    const response = await this.request<TokenResponse>("/api/auth/change-password", {
       method: "POST",
       body: JSON.stringify({
         current_password: currentPassword,
         new_password: newPassword,
       }),
     });
+    this.setTokens(response.access_token, response.refresh_token);
   }
 
   // Invite endpoints
@@ -293,20 +308,10 @@ class ApiClient {
   }
 
   // Room endpoints
-  async createRoom(
-    publicKey: string,
-    name?: string,
-    allowRelay: boolean = true,
-    expiresInHours: number = 24
-  ): Promise<RoomResponse> {
+  async createRoom(publicKey: string, name?: string): Promise<RoomResponse> {
     return this.request("/api/rooms", {
       method: "POST",
-      body: JSON.stringify({
-        name,
-        public_key: publicKey,
-        allow_relay: allowRelay,
-        expires_in_hours: expiresInHours,
-      }),
+      body: JSON.stringify({ name, public_key: publicKey }),
     });
   }
 
@@ -317,17 +322,7 @@ class ApiClient {
     });
   }
 
-  async listRooms(): Promise<
-    Array<{
-      id: string;
-      code: string;
-      name: string | null;
-      room_type: string;
-      member_count: number;
-      created_at: string;
-      expires_at: string | null;
-    }>
-  > {
+  async listRooms(): Promise<RoomListItem[]> {
     return this.request("/api/rooms");
   }
 
@@ -335,15 +330,8 @@ class ApiClient {
     return this.deduplicatedRequest(`/api/rooms/${roomId}`);
   }
 
-  async getSafetyNumber(
-    roomId: string,
-    peerUserId: string
-  ): Promise<{
-    safety_number: string;
-    emoji_fingerprint_self: string[];
-    emoji_fingerprint_peer: string[];
-  }> {
-    return this.request(`/api/rooms/${roomId}/safety-number/${peerUserId}`);
+  async listMessages(roomId: string): Promise<MessageResponse[]> {
+    return this.request(`/api/rooms/${roomId}/messages`);
   }
 
   async deleteRoom(roomId: string): Promise<void> {
@@ -357,98 +345,86 @@ class ApiClient {
   // Transfer endpoints
   async initTransfer(
     roomId: string,
-    encryptedFilename: string,
-    encryptedMimetype: string | null,
-    fileSize: number,
-    nonce: string,
-    mode: "p2p" | "relay" = "relay",
-    expiresInHours: number = 24,
-    maxDownloads: number = 9999
+    encryptedMeta: string,
+    fileSize: number
   ): Promise<TransferResponse> {
     return this.request("/api/transfers", {
       method: "POST",
       body: JSON.stringify({
         room_id: roomId,
-        encrypted_filename: encryptedFilename,
-        encrypted_mimetype: encryptedMimetype,
+        encrypted_meta: encryptedMeta,
         file_size: fileSize,
-        nonce,
-        mode,
-        expires_in_hours: expiresInHours,
-        max_downloads: maxDownloads,
       }),
     });
   }
 
+  /**
+   * Fetch with the access token, for binary bodies that bypass request().
+   * A long transfer can outlive the token, so a 401 refreshes it and retries once.
+   */
+  private async authedFetch(url: string, init: RequestInit = {}): Promise<Response> {
+    const send = () =>
+      fetch(url, {
+        ...init,
+        headers: { ...init.headers, Authorization: `Bearer ${this.accessToken}` },
+      });
+
+    const response = await send();
+    if (response.status === 401 && (await this.refresh())) {
+      return send();
+    }
+    return response;
+  }
+
+  /** Upload one sealed chunk as the raw request body. Safe to retry. */
   async uploadChunk(
     transferId: string,
     chunkIndex: number,
-    chunk: Blob,
+    chunk: Uint8Array,
     maxRetries: number = 3
-  ): Promise<{
-    transfer_id: string;
-    chunk_index: number;
-    uploaded_chunks: number;
-    total_chunks: number;
-    status: string;
-  }> {
+  ): Promise<void> {
     const url = `${API_BASE}/api/transfers/${transferId}/chunks/${chunkIndex}`;
-    
+
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 60000);
-        
-        const formData = new FormData();
-        formData.append("chunk", chunk);
-
-        const response = await fetch(url, {
+        const response = await this.authedFetch(url, {
           method: "POST",
-          headers: {
-            Authorization: `Bearer ${this.accessToken}`,
-          },
-          body: formData,
-          signal: controller.signal,
+          headers: { "Content-Type": "application/octet-stream" },
+          body: new Blob([chunk as BlobPart]),
+          signal: AbortSignal.timeout(60000),
         });
-        
-        clearTimeout(timeout);
 
-        if (!response.ok) {
-          const error = await response.json().catch(() => ({}));
-          throw new ApiError(
-            error.detail || "Upload failed",
-            response.status,
-            error.detail
-          );
+        if (response.ok) return;
+
+        const error = await response.json().catch(() => ({}));
+        const apiError = new ApiError(
+          error.detail || "Upload failed",
+          response.status,
+          error.detail
+        );
+        // The server refused this chunk; sending it again will not help
+        if (response.status < 500 && response.status !== 429) {
+          attempt = maxRetries;
         }
-
-        return response.json();
+        throw apiError;
       } catch (err) {
-        if (attempt === maxRetries) throw err;
-        // Wait before retry with exponential backoff
+        if (attempt >= maxRetries) throw err;
+        // Wait before retry with increasing delay
         await this.sleep(1000 * (attempt + 1));
       }
     }
-    
-    throw new ApiError("Upload failed after retries", 0);
   }
 
-  async getTransfer(transferId: string): Promise<TransferResponse> {
-    return this.request(`/api/transfers/${transferId}`);
-  }
-
+  /** Download a transfer as a stream of encrypted bytes. */
   async downloadFile(transferId: string): Promise<{
-    data: Blob;
-    nonce: string;
+    stream: AsyncGenerator<Uint8Array>;
+    totalBytes: number;
   }> {
-    const url = `${API_BASE}/api/transfers/${transferId}/download`;
-    const response = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${this.accessToken}`,
-      },
-    });
+    const response = await this.authedFetch(
+      `${API_BASE}/api/transfers/${transferId}/download`
+    );
 
-    if (!response.ok) {
+    if (!response.ok || !response.body) {
       const error = await response.json().catch(() => ({}));
       throw new ApiError(
         error.detail || "Download failed",
@@ -457,10 +433,21 @@ class ApiClient {
       );
     }
 
-    const nonce = response.headers.get("X-Transfer-Nonce") || "";
-    const data = await response.blob();
+    // A reader loop rather than for-await on the body: Safari has no
+    // async iteration for ReadableStream
+    const reader = response.body.getReader();
+    async function* read() {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        yield value;
+      }
+    }
 
-    return { data, nonce };
+    return {
+      stream: read(),
+      totalBytes: Number(response.headers.get("Content-Length")) || 0,
+    };
   }
 
   async listRoomTransfers(roomId: string): Promise<TransferResponse[]> {
@@ -471,14 +458,21 @@ class ApiClient {
     await this.request(`/api/transfers/${transferId}`, { method: "DELETE" });
   }
 
-  // WebSocket URL
+  // WebSocket URL. The token is sent as the first message, not in the URL.
   getWebSocketUrl(roomId: string): string {
-    const wsBase = API_BASE.replace(/^http/, "ws");
-    return `${wsBase}/api/ws/${roomId}?token=${this.accessToken}`;
+    const base = API_BASE || window.location.origin;
+    return `${base.replace(/^http/, "ws")}/api/ws/${roomId}`;
   }
 }
 
 // Export singleton instance
 export const api = new ApiClient();
 export { ApiError };
-export type { UserResponse, RoomResponse, RoomMember, TransferResponse };
+export type {
+  UserResponse,
+  RoomResponse,
+  RoomListItem,
+  RoomMember,
+  MessageResponse,
+  TransferResponse,
+};

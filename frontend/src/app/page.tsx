@@ -8,7 +8,8 @@ import { useRoomStore } from "@/store/room";
 import { useLoader } from "@/hooks/useLoader";
 import { AppHeader } from "@/components/AppHeader";
 import { ThemeToggle } from "@/components/ThemeToggle";
-import { Lock, Plus, LogIn, ShieldCheck, Server, Zap, Shield } from "lucide-react";
+import { api, RoomListItem } from "@/lib/api";
+import { Lock, Plus, LogIn, ShieldCheck, Server, ImageIcon, Shield, ChevronRight } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -24,6 +25,7 @@ export default function Home() {
   const [isJoining, setIsJoining] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const [rooms, setRooms] = useState<RoomListItem[]>([]);
 
   useEffect(() => {
     const checkAuth = async () => {
@@ -35,6 +37,11 @@ export default function Home() {
     checkAuth();
   }, [fetchUser, setLoading]);
 
+  useEffect(() => {
+    if (!authChecked || !isAuthenticated) return;
+    api.listRooms().then(setRooms).catch(() => {});
+  }, [authChecked, isAuthenticated]);
+
   // Don't render anything until auth check completes
   if (!authChecked) return null;
 
@@ -42,8 +49,8 @@ export default function Home() {
     setError(null);
     setIsCreating(true);
     try {
-      const room = await createRoom();
-      router.push(`/room/${room.id}`);
+      const roomId = await createRoom();
+      router.push(`/room/${roomId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create room");
     } finally {
@@ -58,8 +65,8 @@ export default function Home() {
     setError(null);
     setIsJoining(true);
     try {
-      const room = await joinRoom(joinCode.trim().toUpperCase());
-      router.push(`/room/${room.id}`);
+      const roomId = await joinRoom(joinCode.trim().toUpperCase());
+      router.push(`/room/${roomId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to join room");
     } finally {
@@ -72,7 +79,7 @@ export default function Home() {
     const features = [
       { icon: Lock, title: "E2E Encrypted", desc: "Your files are encrypted before leaving your device", color: "text-blue-500" },
       { icon: Server, title: "Self-Hosted", desc: "Runs on your own hardware, under your control", color: "text-green-500" },
-      { icon: Zap, title: "P2P Transfer", desc: "Direct transfers when possible, no middleman", color: "text-purple-500" },
+      { icon: ImageIcon, title: "Built for Photos", desc: "Send images up to 50 MB with instant previews", color: "text-purple-500" },
       { icon: Shield, title: "Verified", desc: "Safety numbers to verify recipients", color: "text-orange-500" },
     ];
 
@@ -143,7 +150,7 @@ export default function Home() {
                 <CardTitle>Create Room</CardTitle>
               </div>
               <CardDescription>
-                Start a new secure transfer room. Share the code with your friend to begin.
+                Start a new secure room for two. Share the code with your friend to begin.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -163,7 +170,7 @@ export default function Home() {
                 <CardTitle>Join Room</CardTitle>
               </div>
               <CardDescription>
-                Enter a room code to join an existing transfer session.
+                Enter a room code to join a friend&apos;s room.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -188,6 +195,38 @@ export default function Home() {
               </form>
             </CardContent>
           </Card>
+
+          {/* My rooms */}
+          {rooms.length > 0 && (
+            <Card className="sm:col-span-2 lg:col-span-3 order-first">
+              <CardHeader>
+                <CardTitle>Your Rooms</CardTitle>
+                <CardDescription>
+                  Rooms stay open for a week. Messages and files wait here until you pick them up.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-1">
+                {rooms.map((room) => (
+                  <Button
+                    key={room.id}
+                    variant="ghost"
+                    className="w-full justify-between h-auto py-2"
+                    asChild
+                  >
+                    <Link href={`/room/${room.id}`}>
+                      <span className="flex items-center gap-3 min-w-0">
+                        <span className="font-mono font-bold tracking-wider text-primary">{room.code}</span>
+                        <span className="truncate text-sm text-foreground">
+                          {room.peer_name ? `with ${room.peer_name}` : "Waiting for someone to join"}
+                        </span>
+                      </span>
+                      <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />
+                    </Link>
+                  </Button>
+                ))}
+              </CardContent>
+            </Card>
+          )}
 
           {/* Security note */}
           <Card className="lg:col-span-1">

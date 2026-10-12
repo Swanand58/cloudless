@@ -1,6 +1,7 @@
 /**
  * Client-side cryptographic utilities using TweetNaCl.
  * All encryption/decryption happens in the browser - server never sees plaintext.
+ * File encryption lives in filecrypt.ts.
  */
 
 import nacl from "tweetnacl";
@@ -77,82 +78,6 @@ export function decryptMessage(
 }
 
 /**
- * Encrypt binary data (e.g., file chunks) using XSalsa20-Poly1305.
- */
-export function encryptData(
-  data: Uint8Array,
-  sharedSecret: Uint8Array
-): { ciphertext: Uint8Array; nonce: Uint8Array } {
-  const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
-  const ciphertext = nacl.secretbox(data, nonce, sharedSecret);
-
-  return { ciphertext, nonce };
-}
-
-/**
- * Decrypt binary data using XSalsa20-Poly1305.
- */
-export function decryptData(
-  ciphertext: Uint8Array,
-  nonce: Uint8Array,
-  sharedSecret: Uint8Array
-): Uint8Array | null {
-  return nacl.secretbox.open(ciphertext, nonce, sharedSecret);
-}
-
-/**
- * Encrypt a file in chunks for streaming upload.
- * Returns an async generator that yields encrypted chunks.
- */
-export async function* encryptFileChunks(
-  file: File,
-  sharedSecret: Uint8Array,
-  chunkSize: number = 64 * 1024 // 64KB chunks
-): AsyncGenerator<{ chunk: Uint8Array; nonce: Uint8Array; index: number }> {
-  const totalChunks = Math.ceil(file.size / chunkSize);
-
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * chunkSize;
-    const end = Math.min(start + chunkSize, file.size);
-    const blob = file.slice(start, end);
-    const arrayBuffer = await blob.arrayBuffer();
-    const data = new Uint8Array(arrayBuffer);
-
-    const { ciphertext, nonce } = encryptData(data, sharedSecret);
-    yield { chunk: ciphertext, nonce, index: i };
-  }
-}
-
-/**
- * Decrypt file chunks and reconstruct the file.
- */
-export async function decryptFileChunks(
-  chunks: { data: Uint8Array; nonce: Uint8Array }[],
-  sharedSecret: Uint8Array
-): Promise<Uint8Array | null> {
-  const decryptedChunks: Uint8Array[] = [];
-
-  for (const { data, nonce } of chunks) {
-    const decrypted = decryptData(data, nonce, sharedSecret);
-    if (!decrypted) {
-      return null; // Decryption failed
-    }
-    decryptedChunks.push(decrypted);
-  }
-
-  // Combine all chunks
-  const totalLength = decryptedChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of decryptedChunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-
-  return result;
-}
-
-/**
  * Generate a safety number from two public keys for verification.
  * Both parties will compute the same number.
  */
@@ -209,24 +134,4 @@ export async function generateEmojiFingerprint(publicKey: string): Promise<strin
   }
 
   return fingerprint;
-}
-
-/**
- * Encrypt filename for transfer (server should not know file names).
- */
-export function encryptFilename(
-  filename: string,
-  sharedSecret: Uint8Array
-): EncryptedData {
-  return encryptMessage(filename, sharedSecret);
-}
-
-/**
- * Decrypt filename after transfer.
- */
-export function decryptFilename(
-  encrypted: EncryptedData,
-  sharedSecret: Uint8Array
-): string | null {
-  return decryptMessage(encrypted, sharedSecret);
 }

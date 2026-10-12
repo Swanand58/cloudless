@@ -2,10 +2,10 @@
 
 import secrets
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, ForeignKey, Text, Boolean
+from sqlalchemy import String, ForeignKey, Text, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.database import Base
+from app.database import Base, UTCDateTime
 
 
 def utc_now() -> datetime:
@@ -41,7 +41,7 @@ class Message(Base):
     encrypted_content: Mapped[str] = mapped_column(Text, nullable=False)
     # Nonce used for encryption (base64 encoded, 24 bytes for XChaCha20)
     nonce: Mapped[str] = mapped_column(String(44), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
     # Whether message has been delivered to all recipients
     delivered: Mapped[bool] = mapped_column(Boolean, default=False)
 

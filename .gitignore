@@ -18,6 +18,8 @@ build/
 # Database
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 
 # Uploaded files
 uploads/
@@ -37,15 +39,10 @@ Thumbs.db
 npm-debug.log*
 
 # Test coverage
+.pytest_cache/
 coverage/
 .coverage
 htmlcov/
-
-# Local deploy scripts
-start.sh
-stop.sh
-.pids/
-.logs/
 
 # Misc
 *.bak

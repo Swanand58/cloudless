@@ -5,7 +5,7 @@ from collections import defaultdict
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-from fastapi import HTTPException, status
+from fastapi import status
 
 from app.config import settings
 
@@ -24,16 +24,16 @@ class RateLimiter:
         window_start = now - self.window
 
         # Clean old requests
-        self.clients[client_id] = [
-            req_time for req_time in self.clients[client_id] if req_time > window_start
-        ]
+        recent = [t for t in self.clients[client_id] if t > window_start]
 
         # Check limit
-        if len(self.clients[client_id]) >= self.requests:
+        if len(recent) >= self.requests:
+            self.clients[client_id] = recent
             return False
 
         # Record request
-        self.clients[client_id].append(now)
+        recent.append(now)
+        self.clients[client_id] = recent
         return True
 
     def get_retry_after(self, client_id: str) -> int:
@@ -50,100 +50,64 @@ rate_limiter = RateLimiter(
     window_seconds=settings.rate_limit_window_seconds,
 )
 
+# Stricter limiter for password guessing targets
+auth_rate_limiter = RateLimiter(
+    requests=settings.auth_rate_limit_requests,
+    window_seconds=settings.rate_limit_window_seconds,
+)
+
+AUTH_LIMITED_PATHS = ("/api/auth/login", "/api/auth/register")
+
+
+def get_client_ip(request: Request) -> str:
+    """Get the real client IP.
+
+    The backend is only reachable through the reverse proxy and Cloudflare
+    Tunnel, so the Cloudflare header can be trusted when present.
+    """
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Middleware to add security headers to all responses."""
+    """Middleware to add security headers and rate limiting to API responses."""
 
     async def dispatch(self, request: Request, call_next) -> Response:
-        # BaseHTTPMiddleware breaks WebSocket connections - skip entirely
-        if request.url.path.startswith("/api/ws"):
-            return await call_next(request)
-
-        # Get client IP (handle proxies)
-        client_ip = request.client.host if request.client else "unknown"
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            client_ip = forwarded.split(",")[0].strip()
+        client_ip = get_client_ip(request)
+        path = request.url.path
 
         # Skip rate limiting for:
-        # - Static files
-        # - WebSocket upgrades
         # - OPTIONS preflight requests (CORS)
-        # - Chunk uploads (many sequential requests expected)
-        skip_rate_limit = (
-            request.url.path.startswith("/static") or
-            request.url.path.startswith("/api/ws") or
-            request.method == "OPTIONS" or
-            "/chunks/" in request.url.path
-        )
-        
+        # - Chunk uploads (many sequential requests expected, auth required)
+        skip_rate_limit = request.method == "OPTIONS" or "/chunks/" in path
+
         if not skip_rate_limit:
-            if not rate_limiter.is_allowed(client_ip):
-                retry_after = rate_limiter.get_retry_after(client_ip)
-                # Include CORS headers in rate limit response
-                origin = request.headers.get("origin", "")
-                cors_headers = {
-                    "Retry-After": str(retry_after),
-                }
-                # Add CORS headers if origin is allowed
-                allowed_origins = settings.cors_origins
-                if origin in allowed_origins or "*" in allowed_origins:
-                    cors_headers.update({
-                        "Access-Control-Allow-Origin": origin,
-                        "Access-Control-Allow-Credentials": "true",
-                    })
+            limiter = auth_rate_limiter if path in AUTH_LIMITED_PATHS else rate_limiter
+            if not limiter.is_allowed(client_ip):
                 return Response(
                     content="Rate limit exceeded",
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    headers=cors_headers,
+                    headers={"Retry-After": str(limiter.get_retry_after(client_ip))},
                 )
 
         response = await call_next(request)
 
-        # Security headers
+        # Security headers (the page's Content-Security-Policy is set by the
+        # frontend, which serves the HTML)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Cache-Control"] = "no-store"
 
         # HSTS (only in production with HTTPS)
         if not settings.debug:
             response.headers["Strict-Transport-Security"] = (
                 "max-age=31536000; includeSubDomains"
             )
-
-        # Content Security Policy
-        # In debug mode, allow CDN resources for Swagger UI
-        if settings.debug:
-            csp_directives = [
-                "default-src 'self'",
-                "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net",
-                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
-                "img-src 'self' data: blob: https://fastapi.tiangolo.com",
-                "font-src 'self' https://cdn.jsdelivr.net",
-                "connect-src 'self' wss: ws:",
-                "frame-ancestors 'none'",
-                "base-uri 'self'",
-                "form-action 'self'",
-            ]
-        else:
-            csp_directives = [
-                "default-src 'self'",
-                "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
-                "style-src 'self' 'unsafe-inline'",
-                "img-src 'self' data: blob:",
-                "font-src 'self'",
-                "connect-src 'self' wss: ws:",
-                "frame-ancestors 'none'",
-                "base-uri 'self'",
-                "form-action 'self'",
-            ]
-        response.headers["Content-Security-Policy"] = "; ".join(csp_directives)
-
-        # Permissions Policy
-        response.headers["Permissions-Policy"] = (
-            "accelerometer=(), camera=(), geolocation=(), gyroscope=(), "
-            "magnetometer=(), microphone=(), payment=(), usb=()"
-        )
 
         return response

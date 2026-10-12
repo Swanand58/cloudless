@@ -2,11 +2,13 @@
 
 import secrets
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, ForeignKey, Text, Boolean, BigInteger, Enum
+from pathlib import Path
+from sqlalchemy import String, ForeignKey, Text, BigInteger, Enum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 import enum
 
-from app.database import Base
+from app.config import settings
+from app.database import Base, UTCDateTime
 
 
 def utc_now() -> datetime:
@@ -22,27 +24,16 @@ def generate_transfer_id() -> str:
 class TransferStatus(enum.Enum):
     """Status of a file transfer."""
 
-    PENDING = "pending"  # Waiting for upload
-    UPLOADING = "uploading"  # Currently uploading
-    READY = "ready"  # Ready for download
-    DOWNLOADING = "downloading"  # Currently being downloaded
-    COMPLETED = "completed"  # Successfully transferred
-    EXPIRED = "expired"  # Expired before download
-    CANCELLED = "cancelled"  # Cancelled by sender
-
-
-class TransferMode(enum.Enum):
-    """Mode of file transfer."""
-
-    P2P = "p2p"  # Direct peer-to-peer via WebRTC
-    RELAY = "relay"  # Server relay (encrypted)
+    UPLOADING = "uploading"  # Chunks still arriving
+    READY = "ready"  # All chunks stored, ready for download
 
 
 class FileTransfer(Base):
     """File transfer record.
 
     Files are E2E encrypted - the server only stores encrypted blobs
-    and cannot read file contents or even the original filename.
+    and cannot read file contents, names or types. A transfer lives until
+    its room expires or the sender cancels it.
     """
 
     __tablename__ = "file_transfers"
@@ -56,63 +47,28 @@ class FileTransfer(Base):
     sender_id: Mapped[str] = mapped_column(
         String(32), ForeignKey("users.id"), nullable=False
     )
-    # Encrypted filename (base64 encoded ciphertext)
-    encrypted_filename: Mapped[str] = mapped_column(Text, nullable=False)
-    # Encrypted mime type (base64 encoded ciphertext)
-    encrypted_mimetype: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # File size in bytes (this is visible to server for storage management)
+    # Encrypted metadata: base64 of nonce || ciphertext of a JSON object
+    # holding name, type, hash and thumbnail
+    encrypted_meta: Mapped[str] = mapped_column(Text, nullable=False)
+    # Plaintext size in bytes (visible to server for storage management)
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    # Path to encrypted file on disk (for relay mode)
-    storage_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Transfer mode
-    mode: Mapped[TransferMode] = mapped_column(
-        Enum(TransferMode), default=TransferMode.RELAY
-    )
-    # Transfer status
     status: Mapped[TransferStatus] = mapped_column(
-        Enum(TransferStatus), default=TransferStatus.PENDING
+        Enum(TransferStatus), default=TransferStatus.UPLOADING
     )
-    # Nonce used for file encryption (base64 encoded)
-    nonce: Mapped[str] = mapped_column(String(44), nullable=False)
-    # Number of chunks (for large file transfers)
     total_chunks: Mapped[int] = mapped_column(default=1)
-    uploaded_chunks: Mapped[int] = mapped_column(default=0)
-    # Timestamps
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    # Download tracking
-    download_count: Mapped[int] = mapped_column(default=0)
-    max_downloads: Mapped[int] = mapped_column(default=9999)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utc_now)
 
     # Relationships
     room: Mapped["Room"] = relationship("Room", back_populates="transfers")
 
     @property
-    def is_expired(self) -> bool:
-        """Check if transfer has expired."""
-        if self.status == TransferStatus.EXPIRED:
-            return True
-        if self.expires_at:
-            # Handle both naive and aware datetimes from the DB
-            now = datetime.now(timezone.utc)
-            expires = self.expires_at
-            if expires.tzinfo is None:
-                expires = expires.replace(tzinfo=timezone.utc)
-            if now > expires:
-                return True
-        return False
+    def storage_dir(self) -> Path:
+        """Directory holding this transfer's encrypted chunks."""
+        return settings.upload_dir / self.id
 
-    @property
-    def can_download(self) -> bool:
-        """Check if file can be downloaded."""
-        if self.status != TransferStatus.READY:
-            return False
-        if self.is_expired:
-            return False
-        if self.download_count >= self.max_downloads:
-            return False
-        return True
+    def chunk_path(self, index: int) -> Path:
+        """Path of one encrypted chunk on disk."""
+        return self.storage_dir / f"chunk_{index:06d}"
 
     def __repr__(self) -> str:
         return f"<FileTransfer {self.id} status={self.status.value}>"

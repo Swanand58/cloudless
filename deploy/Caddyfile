@@ -1,0 +1,8 @@
+# Single origin for the app. TLS is terminated upstream (Cloudflare Tunnel),
+# so this listens on plain HTTP inside the Docker network.
+:80 {
+	@api path /api/*
+	reverse_proxy @api backend:8000
+
+	reverse_proxy frontend:3000
+}

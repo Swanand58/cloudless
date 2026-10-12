@@ -1,0 +1,5 @@
+# Cloudflare named tunnel: send everything to the proxy.
+# The tunnel ID and credentials come from docker-compose.yml and .env.
+credentials-file: /etc/cloudflared/credentials.json
+ingress:
+  - service: http://proxy:80

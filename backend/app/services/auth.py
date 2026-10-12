@@ -14,73 +14,65 @@ class AuthService:
     """Authentication and authorization service."""
 
     @staticmethod
-    def create_access_token(user_id: str, expires_delta: timedelta | None = None) -> str:
-        """Create a JWT access token.
-
-        Args:
-            user_id: User ID to encode in token
-            expires_delta: Optional custom expiration time
-
-        Returns:
-            Encoded JWT token
-        """
-        if expires_delta:
-            expire = datetime.now(timezone.utc) + expires_delta
-        else:
-            expire = datetime.now(timezone.utc) + timedelta(
-                minutes=settings.access_token_expire_minutes
-            )
-
+    def _create_token(user_id: str, token_type: str, expires_delta: timedelta) -> str:
+        now = datetime.now(timezone.utc)
         to_encode = {
             "sub": user_id,
-            "exp": expire,
-            "type": "access",
+            "iat": int(now.timestamp()),
+            "exp": now + expires_delta,
+            "type": token_type,
         }
         return jwt.encode(to_encode, settings.secret_key, algorithm=settings.jwt_algorithm)
+
+    @staticmethod
+    def create_access_token(user_id: str) -> str:
+        """Create a JWT access token."""
+        return AuthService._create_token(
+            user_id, "access", timedelta(minutes=settings.access_token_expire_minutes)
+        )
 
     @staticmethod
     def create_refresh_token(user_id: str) -> str:
-        """Create a JWT refresh token.
-
-        Args:
-            user_id: User ID to encode in token
-
-        Returns:
-            Encoded JWT refresh token
-        """
-        expire = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days)
-
-        to_encode = {
-            "sub": user_id,
-            "exp": expire,
-            "type": "refresh",
-        }
-        return jwt.encode(to_encode, settings.secret_key, algorithm=settings.jwt_algorithm)
+        """Create a JWT refresh token."""
+        return AuthService._create_token(
+            user_id, "refresh", timedelta(days=settings.refresh_token_expire_days)
+        )
 
     @staticmethod
-    def verify_token(token: str, token_type: str = "access") -> str | None:
-        """Verify a JWT token and return the user ID.
+    async def get_user_from_token(
+        db: AsyncSession, token: str, token_type: str = "access"
+    ) -> User | None:
+        """Verify a JWT token and return its user.
 
         Args:
+            db: Database session
             token: JWT token to verify
             token_type: Expected token type ("access" or "refresh")
 
         Returns:
-            User ID if valid, None otherwise
+            User if the token is valid and was issued after the user's last
+            password change, None otherwise
         """
         try:
             payload = jwt.decode(
                 token, settings.secret_key, algorithms=[settings.jwt_algorithm]
             )
-            user_id: str = payload.get("sub")
-            token_type_claim: str = payload.get("type")
-
-            if user_id is None or token_type_claim != token_type:
-                return None
-
-            return user_id
         except JWTError:
             return None
+
+        user_id = payload.get("sub")
+        if user_id is None or payload.get("type") != token_type:
+            return None
+
+        user = await AuthService.get_user_by_id(db, user_id)
+        if not user:
+            return None
+
+        changed = user.password_changed_at
+        if changed and payload.get("iat", 0) < int(changed.timestamp()):
+            return None
+
+        return user
 
     @staticmethod
     async def authenticate_user(
@@ -167,12 +159,11 @@ class AuthService:
             is_admin=False,
         )
         db.add(user)
+        await db.flush()  # Assigns user.id
 
         # Mark invite as used
         invite.use_count += 1
         invite.used_by = user.id
-
-        await db.flush()
 
         return user, ""
 

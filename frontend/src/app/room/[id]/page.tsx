@@ -1,12 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useParams } from "next/navigation";
 import Link from "next/link";
-import { useAuthStore } from "@/store/auth";
 import { useRoomStore } from "@/store/room";
 import { useLoader } from "@/hooks/useLoader";
-import { api } from "@/lib/api";
+import { withAuth } from "@/lib/withAuth";
 import { toast } from "sonner";
 
 import { RoomHeader } from "@/components/room/RoomHeader";
@@ -24,31 +23,27 @@ import {
 } from "@/components/ui/sheet";
 import { AlertTriangle, UserMinus, UserPlus, Users } from "lucide-react";
 
-export default function RoomPage() {
+function RoomPage() {
   const params = useParams();
-  const router = useRouter();
   const roomId = params.id as string;
 
-  const { isAuthenticated, fetchUser } = useAuthStore();
-  const { 
-    loadRoom, 
-    leaveRoom, 
-    currentRoom, 
-    lastUserJoined, 
-    lastUserLeft, 
-    clearLastUserJoined, 
-    clearLastUserLeft 
+  const {
+    loadRoom,
+    closeRoom,
+    currentRoom,
+    lastUserJoined,
+    lastUserLeft,
+    clearLastUserJoined,
+    clearLastUserLeft
   } = useRoomStore();
   const { setLoading } = useLoader();
 
-  const [isPageLoading, setIsPageLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [hasInitialized, setHasInitialized] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   useEffect(() => {
     if (lastUserJoined) {
-      toast(`${lastUserJoined} joined the room`, {
+      toast(`${lastUserJoined} is online`, {
         icon: <UserPlus className="h-4 w-4 text-green-500" />,
         duration: 4000,
       });
@@ -58,7 +53,7 @@ export default function RoomPage() {
 
   useEffect(() => {
     if (lastUserLeft) {
-      toast(`${lastUserLeft} left the room`, {
+      toast(`${lastUserLeft} went offline`, {
         icon: <UserMinus className="h-4 w-4 text-muted-foreground" />,
         duration: 4000,
       });
@@ -67,47 +62,26 @@ export default function RoomPage() {
   }, [lastUserLeft, clearLastUserLeft]);
 
   useEffect(() => {
-    if (hasInitialized) return;
-    setLoading(true, "Checking authentication...");
-    fetchUser();
-  }, [fetchUser, hasInitialized, setLoading]);
+    let cancelled = false;
 
-  useEffect(() => {
-    if (hasInitialized) return;
+    setLoading(true, "Loading room...");
+    loadRoom(roomId)
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load room");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
 
-    if (!isAuthenticated) {
-      const timeout = setTimeout(() => {
-        if (!api.isAuthenticated()) {
-          setLoading(false);
-          router.push("/login");
-        }
-      }, 100);
-      return () => clearTimeout(timeout);
-    }
-
-    const initRoom = async () => {
-      try {
-        setHasInitialized(true);
-        setLoading(true, "Loading room...");
-        await loadRoom(roomId);
-        setIsPageLoading(false);
-        setLoading(false);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load room");
-        setIsPageLoading(false);
-        setLoading(false);
-      }
-    };
-    initRoom();
-
+    // Leaving the page disconnects; the room and its keys are kept
     return () => {
-      leaveRoom();
+      cancelled = true;
+      setLoading(false);
+      closeRoom();
     };
-  }, [roomId, isAuthenticated, loadRoom, leaveRoom, router, hasInitialized, setLoading]);
+  }, [roomId, loadRoom, closeRoom, setLoading]);
 
-  if (isPageLoading) return null;
-
-  if (error && !currentRoom) {
+  if (error) {
     return (
       <div className="min-h-screen flex items-center justify-center p-4 sm:p-8">
         <div className="text-center max-w-md">
@@ -123,6 +97,8 @@ export default function RoomPage() {
       </div>
     );
   }
+
+  if (!currentRoom) return null;
 
   const sidebarContent = (
     <div className="space-y-4">
@@ -172,3 +148,5 @@ export default function RoomPage() {
     </div>
   );
 }
+
+export default withAuth(RoomPage);
